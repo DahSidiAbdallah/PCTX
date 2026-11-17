@@ -1,89 +1,115 @@
-<p align="center">
-	<img src="logo.png" alt="logo" width="240" />
+﻿<p align="center">
+  <img src="logo.png" alt="PCSX2 Patch & Texture Manager logo" width="240" />
 </p>
 
-# PCSX2 Manager — Beta
+# PCSX2 Patch & Texture Manager
 
-A library-first desktop tool: point it at your PS2 games folder, then pick a game and install its matching cheats and texture pack with one click.
+This project is a desktop utility for organizing and installing the parts of a PS2 game setup that usually take the most time to manage: cheat patches and texture packs.
 
-Version: beta
+Instead of hunting through folders, serials, and patch files manually, the app lets you scan a game library, match each title to the correct region and serial, and install the relevant content in one pass.
 
-## Summary
+It is built with PySide6 and is designed to fit into a normal PCSX2 workflow without making the process feel like a chore.
 
-This project provides a Qt-based desktop application (PySide6) built around your game library rather than manual browsing. It includes:
+## What it does
 
-- **Library scan**: point it at a folder of PS2 disc images (`.iso`/`.bin`/`.chd`/`.cso`) and it detects each game's serial/title from the filename. Games that aren't picked up automatically can be added manually by serial.
-- **One-click sync**: select a game and click "Sync This Game" to install its cheats (from a bundled offline database, falling back to online sources) and its texture pack (from a small curated GitHub-repo index), always matched to that game's exact region/serial.
-- **Custom window chrome**: a frameless, dark-themed title bar instead of the native OS chrome.
-- **Advanced tools** (title bar menu): the original manual `.pnach` editor (RAW ↔ PNACH conversion/preview, raw code parsing, online cheat search) and texture pack manager (drag & drop `.zip`/folder install, staging) are still there for power users, just tucked out of the primary flow.
-- **Settings** (gear icon): PCSX2 folder detection/override, INI toggles, quick launch, game profiles.
+- Scans a folder of PS2 disc images such as `.iso`, `.bin`, `.chd`, and `.cso`
+- Detects game serials and titles from filenames where possible
+- Lets you add games manually when matching is incomplete
+- Installs matching cheat patches from a bundled local database with online fallback support
+- Installs texture packs from a curated source list and matches them to the current title/region
+- Includes extra tools for PNACH editing and texture-install workflows for advanced users
+- Keeps settings such as PCSX2 paths and launch preferences in the app itself
 
-## Current implementation / features
+## Core features
 
-- GUI application entrypoint: `main.py` (Qt/PySide6)
-- `LibraryView`: folder scan (`GameScanWorker`), manual add, and sync orchestration reusing the existing cheat/texture install pipelines
-- Local cheats database (`ps2_cheats_database_merged.json`) loaded once and shared across the app; online fallback via `cheat_online.py` (GameHacking.org, PSXDataCenter)
-- Curated texture-pack manifest (`texture_sources.json`, hand-verified GitHub repos) resolved through GitHub's public releases API; installed via `textures_install.py`
-- Title resolver using local bundled PSXDataCenter HTML files (`ulist2.html`, `plist2.html`, `jlist2.html`) and optional online lookup
-- Helpers for parsing and building PNACH files: `parse_pnach_text`, `parse_raw_8x8`, `build_pnach`
-- Thumbnail/cover fetching for installed packs (caches under the user's home directory)
+### Library-based management
+
+Point the app at your PS2 games folder and it will build a library view of the titles it can recognize. From there, you can select a game and sync its patch and texture data instead of managing individual files by hand.
+
+### Cheat handling
+
+The app uses a local cheat database as its main source and falls back to online sources when needed. The idea is to keep common setups working offline while still allowing online lookups when the database is missing a title.
+
+### Texture pack support
+
+Texture installs are handled through a curated manifest and the app tries to resolve the correct pack for the selected game using region/serial information. This keeps the install flow focused and avoids the usual mismatch problems that come with manual pack management.
+
+### Advanced tools
+
+There are also extra tools for users who want more control:
+
+- raw and PNACH conversion helpers
+- cheat parsing and preview support
+- direct texture pack staging and installation tools
+- PCSX2-related settings and quick-launch options
+
+## Project layout
+
+A few of the main files and folders are worth knowing about:
+
+- `main.py` — main Qt application entry point and most of the app logic
+- `cheat_online.py` — online cheat sources and fallback logic
+- `textures_install.py` — texture installation flow
+- `texture_sources.json` — curated texture-pack source mapping
+- `ps2_cheats_database_merged.json` — local cheat database
+- `tests/` — project test suite
+- `CONTRIBUTING.md` — contributor guidance and local workflow
 
 ## Requirements
 
-- Python 3.10+ recommended
+- Python 3.10 or newer
 - PySide6
 - beautifulsoup4
-- requests (optional but recommended for online features)
+- requests (recommended for online cheat/metadata lookups)
 
-To make installation easier a minimal `requirements.txt` is included.
+The repository also includes a minimal [requirements.txt](requirements.txt) to make setup easier.
 
-## Installing (Windows PowerShell)
+## Getting started
 
-1. Create and activate a virtual environment (recommended):
+### 1. Create a virtual environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-2. Install dependencies:
+### 2. Install dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-## Running the GUI
-
-From the repository root (PowerShell):
+### 3. Run the application
 
 ```powershell
 python main.py
 ```
 
-This launches the Qt GUI. The app will look for `logo.png` in the repo root for the window icon.
+The app expects to be launched from the project root. If you have a custom logo asset in the repository, it will be used as the app icon.
 
-## CLI / Tests
+## Typical workflow
 
-- Quick dependency checks are provided by `check_deps.py` and `check_pyside_import.py`.
-- Unit tests live under `tests/` and can be run with pytest (if installed):
+1. Open the app and point it at your PS2 game folder.
+2. Let the library scan detect the games it can recognize.
+3. Pick a title from the library.
+4. Use the sync flow to install the matching cheat patch and texture pack.
+5. If a title is not found automatically, add it manually by serial and continue.
 
-```powershell
-pip install pytest
-pytest -q
-```
+This keeps the app focused on the common use case: getting a game ready with the right patching and textures without a lot of manual setup.
 
-## Notes & Troubleshooting
+## Troubleshooting
 
-- If the GUI fails to start, ensure `PySide6` is installed and compatible with your Python version.
-- Online features gracefully degrade: if `requests` is missing, the app still runs for local/offline work.
-- The app tries to auto-detect common PCSX2 user directories. You can set the base path manually in Settings.
+- If the app fails to start, confirm that PySide6 is installed in the active environment.
+- If online lookups fail, the app should still run for local/offline use.
+- If PCSX2 is installed in a non-standard location, set the path manually in the app settings.
+- If a title is not found automatically, try adding it manually using its serial.
 
 ## Contributing
 
-Please see `CONTRIBUTING.md` for developer notes, testing guidance and how to contribute.
+Contributions are welcome, especially for bug fixes, UI polish, compatibility issues, and better matching logic.
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, testing, and pull request guidance.
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-
-
