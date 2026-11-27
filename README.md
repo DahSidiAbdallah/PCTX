@@ -10,8 +10,6 @@ Point PCTX at the folder where you keep your PS2 disc images, pick a game, and o
 
 PCTX is a Windows desktop app written in Python with PySide6. It does not include games, BIOS images or emulator code, and it is not affiliated with the PCSX2 project.
 
-![Classic view](docs/screenshots/classic-list.png)
-
 ## Features
 
 - **Game library.** Scan a folder for `.iso`, `.bin`, `.cso` and `.chd` images, or add a game by serial. For `.iso`, `.bin` and `.cso`, PCTX reads the serial and the **exact CRC** straight from the disc (the same way PCSX2 computes it), so cheats and patches always match your copy, not a database guess for another revision. Cover art is fetched and cached.
@@ -33,8 +31,6 @@ Switch any time with **F11** (or View > Big Picture). PCTX remembers which one y
 **Classic** is a desktop layout in the spirit of PCSX2's own game list: menu bar, toolbar, a sortable table (or cover grid with a zoom slider) and a status bar.
 
 **Big Picture** is fullscreen and built for a controller or a couch, in the spirit of Steam's Big Picture:
-
-![Big Picture](docs/screenshots/big-picture.png)
 
 
 - A shelf or grid of covers over a soft, blurred backdrop of the selected game, with Library and Settings tabs and filters for All Games, Favorites, Recently Played and Enhanced.
@@ -78,8 +74,6 @@ Run it from the project folder. To open it without a console window, use `python
 2. Turn on the options you want, such as cheats, widescreen patches and texture replacement. Close PCSX2 first; it rewrites its settings when it exits.
 3. **File > Scan Folder** and choose your games folder.
 4. Select a game and press **Enter** (or **Enhancements**). Press **Use recommended**, or tick exactly what you want on the Patches & Fixes, Cheats and Texture Packs tabs, then **Apply**.
-
-![Enhancements](docs/screenshots/enhancements-dialog.png)
 
 ## Where things come from
 

@@ -169,8 +169,8 @@ if not logger.handlers:
 
 # ---------------------------- App identity / settings ----------------------------
 APP_NAME = "PCTX"
-APP_VERSION = "2.0.0"
-USER_AGENT = "PCTX/2.0"
+APP_VERSION = "1.0.0"
+USER_AGENT = "PCTX/1.0"
 # The app was called "PCSX2 Manager" before the PCTX rename, and its settings
 # (PCSX2 paths, profiles, welcome flag, ...) lived under that name. Those are
 # copied across once so renaming doesn't silently reset anyone's setup. The
@@ -8756,7 +8756,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             f"About {APP_NAME}",
-            f"<h3>{APP_NAME} 2.0</h3>"
+            f"<h3>{APP_NAME} {APP_VERSION}</h3>"
             "<p>Cheats and texture packs for your PCSX2 game library.</p>"
             "<ul>"
             "<li>Scan a folder to build your library</li>"

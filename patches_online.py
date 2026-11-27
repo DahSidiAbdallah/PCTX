@@ -27,7 +27,7 @@ REPO = "PCSX2/pcsx2_patches"
 BRANCH = "main"
 TREE_URL = f"https://api.github.com/repos/{REPO}/git/trees/{BRANCH}?recursive=1"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/patches/"
-USER_AGENT = "PCTX/2.0"
+USER_AGENT = "PCTX/1.0"
 INDEX_MAX_AGE_S = 7 * 24 * 3600          # the repo changes slowly; a weekly refresh is plenty
 _FILE_RE = re.compile(r"^patches/([A-Z]{4}-\d{5})_([0-9A-F]{8})\.pnach$")
 _SERIAL_RE = re.compile(r"([A-Za-z]{4})[-_ ]?(\d{5})")
