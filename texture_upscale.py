@@ -69,7 +69,7 @@ def ensure_realesrgan_binary(install_dir: str, progress_cb: Optional[Callable[[s
     try:
         resp = requests.get(
             f'https://api.github.com/repos/{REALESRGAN_REPO}/releases/latest',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'PCSX2-Manager/1.0'},
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'PCTX/2.0'},
             timeout=10,
         )
         if resp.status_code != 200:

@@ -1,96 +1,115 @@
-// Shared input-mode manager for the PS2-style navigation pages: polls the
-// Gamepad API each frame and tracks whether the user's last touch was the
-// keyboard/mouse or a controller, so each page can swap its on-screen prompt
-// glyphs live instead of guessing which one is plugged in.
+// Input for Big Picture: one place that turns keyboard, mouse and any gamepad
+// into the same small set of events, and tracks WHICH device the user touched
+// last so the on-screen button hints always match what is in their hands.
 //
-// Chromium mapping ("standard" gamepad layout, what Xbox controllers map to):
-//   buttons: 0=A 1=B 2=X 3=Y  4=LB 5=RB  12=D-pad Up 13=Down 14=Left 15=Right
-//   axes: 0 = left stick X (-1 left .. 1 right), 1 = left stick Y (-1 up .. 1 down)
+//   device: 'keyboard' | 'mouse' | 'xbox' | 'playstation' | 'nintendo' | 'gamepad'
+//
+// Gamepads use the browser's "standard" layout, so buttons are addressed by
+// position and only their printed label differs per controller family:
+//   0 bottom, 1 right, 2 left, 3 top, 4 LB/L1, 5 RB/R1, 8 View/Create/-,
+//   9 Menu/Options/+, 12 up, 13 down, 14 left, 15 right; axes 0/1 = left stick.
+
+export const FACE_LABELS = {
+  xbox:        { bottom: 'A', right: 'B', left: 'X', top: 'Y', lb: 'LB', rb: 'RB', view: 'View', menu: 'Menu' },
+  playstation: { bottom: '✕', right: '○', left: '□', top: '△', lb: 'L1', rb: 'R1', view: 'Create', menu: 'Options' },
+  nintendo:    { bottom: 'B', right: 'A', left: 'Y', top: 'X', lb: 'L', rb: 'R', view: '−', menu: '+' },
+  gamepad:     { bottom: 'A', right: 'B', left: 'X', top: 'Y', lb: 'LB', rb: 'RB', view: 'View', menu: 'Menu' },
+};
+
+export function padFamily(id) {
+  const s = String(id || '').toLowerCase();
+  if (/054c|sony|playstation|dualshock|dualsense|wireless controller/.test(s)) return 'playstation';
+  if (/057e|nintendo|switch|joy-con|pro controller/.test(s)) return 'nintendo';
+  if (/045e|xbox|xinput|microsoft/.test(s)) return 'xbox';
+  return 'gamepad';
+}
+
+// Held-direction repeat, like a console menu: one step on press, a pause, then
+// a steady fast repeat.
+const REPEAT_DELAY = 380;
+const REPEAT_RATE = 85;
+const DEADZONE = 0.5;
+
 export class InputManager {
   constructor() {
-    this.mode = 'keyboard'; // 'keyboard' | 'gamepad'
-    this._modeListeners = [];
-    this._confirmHandlers = [];
-    this._backHandlers = [];
-    this._dirHandlers = { up: [], down: [], left: [], right: [] };
-    this._shoulderHandlers = { l: [], r: [] };
-    this._buttonHandlers = {}; // index -> [cb, ...], for one-off bindings (e.g. Y)
+    this.device = 'keyboard';
+    this._deviceListeners = [];
+    this._handlers = {};
     this._prevButtons = {};
-    this._repeatAt = {};
-    this._heldDir = { x: 0, y: 0 };
+    this._held = { x: { dir: 0, next: 0 }, y: { dir: 0, next: 0 } };
 
-    // Any real keyboard/mouse touch means the user is back on keyboard,
-    // even mid-session with a controller connected.
-    window.addEventListener('keydown', () => this._setMode('keyboard'));
-    window.addEventListener('mousedown', () => this._setMode('keyboard'));
+    window.addEventListener('keydown', () => this._setDevice('keyboard'), true);
+    window.addEventListener('mousedown', () => this._setDevice('mouse'), true);
+    window.addEventListener('wheel', () => this._setDevice('mouse'), { passive: true, capture: true });
+    window.addEventListener('mousemove', (e) => {
+      // Chromium fires synthetic zero-movement mousemoves when content moves
+      // under a still cursor; those must not flip a controller user to "mouse".
+      if (Math.abs(e.movementX) + Math.abs(e.movementY) > 3) this._setDevice('mouse');
+    }, true);
 
     this._poll = this._poll.bind(this);
     requestAnimationFrame(this._poll);
   }
 
-  onModeChange(cb) { this._modeListeners.push(cb); }
-  onConfirm(cb) { this._confirmHandlers.push(cb); }
-  onBack(cb) { this._backHandlers.push(cb); }
-  onUp(cb) { this._dirHandlers.up.push(cb); }
-  onDown(cb) { this._dirHandlers.down.push(cb); }
-  onLeft(cb) { this._dirHandlers.left.push(cb); }
-  onRight(cb) { this._dirHandlers.right.push(cb); }
-  onShoulderL(cb) { this._shoulderHandlers.l.push(cb); }
-  onShoulderR(cb) { this._shoulderHandlers.r.push(cb); }
-  // Generic escape hatch for one-off button bindings (e.g. Y = button 3)
-  // that don't warrant a dedicated named method.
-  onButton(index, cb) { (this._buttonHandlers[index] = this._buttonHandlers[index] || []).push(cb); }
+  get isPad() { return !(this.device === 'keyboard' || this.device === 'mouse'); }
+  /** 'keyboard' | 'gamepad' -- coarse view kept for simple callers. */
+  get mode() { return this.isPad ? 'gamepad' : 'keyboard'; }
+  /** Labels for the buttons of the controller currently in use. */
+  get labels() { return FACE_LABELS[this.isPad ? this.device : 'xbox']; }
 
-  _setMode(mode) {
-    if (this.mode === mode) return;
-    this.mode = mode;
-    this._modeListeners.forEach((cb) => cb(mode));
+  onModeChange(cb) { this._deviceListeners.push(cb); }
+  /** name: up|down|left|right|confirm|back|button<N> */
+  on(name, cb) { (this._handlers[name] = this._handlers[name] || []).push(cb); }
+  onConfirm(cb) { this.on('confirm', cb); }
+  onBack(cb) { this.on('back', cb); }
+  onUp(cb) { this.on('up', cb); }
+  onDown(cb) { this.on('down', cb); }
+  onLeft(cb) { this.on('left', cb); }
+  onRight(cb) { this.on('right', cb); }
+  onShoulderL(cb) { this.on('button4', cb); }
+  onShoulderR(cb) { this.on('button5', cb); }
+  onButton(index, cb) { this.on('button' + index, cb); }
+
+  _fire(name, repeat) { (this._handlers[name] || []).forEach((cb) => cb({ repeat: !!repeat })); }
+
+  _setDevice(device) {
+    if (this.device === device) return;
+    this.device = device;
+    this._deviceListeners.forEach((cb) => cb(device));
   }
 
-  _poll() {
+  _poll(now) {
     requestAnimationFrame(this._poll);
+    if (document.hidden) return;
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     let pad = null;
-    for (const p of pads) { if (p) { pad = p; break; } }
+    for (const p of pads) { if (p && p.connected) { pad = p; break; } }
     if (!pad) return;
 
-    const isPressed = (i) => !!(pad.buttons[i] && pad.buttons[i].pressed);
-    const justPressed = (i) => isPressed(i) && !this._prevButtons[i];
-
-    if (justPressed(0)) { this._setMode('gamepad'); this._confirmHandlers.forEach((cb) => cb()); }
-    if (justPressed(1)) { this._setMode('gamepad'); this._backHandlers.forEach((cb) => cb()); }
-    if (justPressed(4)) { this._setMode('gamepad'); this._shoulderHandlers.l.forEach((cb) => cb()); }
-    if (justPressed(5)) { this._setMode('gamepad'); this._shoulderHandlers.r.forEach((cb) => cb()); }
-    for (const idx of Object.keys(this._buttonHandlers)) {
-      if (justPressed(Number(idx))) {
-        this._setMode('gamepad');
-        this._buttonHandlers[idx].forEach((cb) => cb());
+    const pressed = (i) => !!(pad.buttons[i] && pad.buttons[i].pressed);
+    for (let i = 0; i < pad.buttons.length; i++) {
+      const down = pressed(i);
+      if (down && !this._prevButtons[i] && !(i >= 12 && i <= 15)) {
+        this._setDevice(padFamily(pad.id));
+        if (i === 0) this._fire('confirm');
+        else if (i === 1) this._fire('back');
+        else this._fire('button' + i);
       }
+      this._prevButtons[i] = down;
     }
 
-    const axisX = pad.axes[0] || 0;
-    const axisY = pad.axes[1] || 0;
-    const now = performance.now();
-    this._pollAxis('x', isPressed(14) ? -1 : isPressed(15) ? 1 : (axisX < -0.5 ? -1 : axisX > 0.5 ? 1 : 0),
-      { [-1]: 'left', [1]: 'right' }, now);
-    this._pollAxis('y', isPressed(12) ? -1 : isPressed(13) ? 1 : (axisY < -0.5 ? -1 : axisY > 0.5 ? 1 : 0),
-      { [-1]: 'up', [1]: 'down' }, now);
-
-    for (let i = 0; i < pad.buttons.length; i++) this._prevButtons[i] = isPressed(i);
+    const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+    const dx = pressed(14) ? -1 : pressed(15) ? 1 : ax < -DEADZONE ? -1 : ax > DEADZONE ? 1 : 0;
+    const dy = pressed(12) ? -1 : pressed(13) ? 1 : ay < -DEADZONE ? -1 : ay > DEADZONE ? 1 : 0;
+    this._axis('x', dx, dx < 0 ? 'left' : 'right', pad, now);
+    this._axis('y', dy, dy < 0 ? 'up' : 'down', pad, now);
   }
 
-  _pollAxis(axis, dir, dirNames, now) {
-    if (dir !== 0) {
-      this._setMode('gamepad');
-      const key = dirNames[dir];
-      // Fire immediately on a fresh press, then repeat on hold.
-      if (this._heldDir[axis] !== dir || now - (this._repeatAt[key] || 0) > 260) {
-        this._dirHandlers[key].forEach((cb) => cb());
-        this._repeatAt[key] = now;
-      }
-      this._heldDir[axis] = dir;
-    } else {
-      this._heldDir[axis] = 0;
-    }
+  _axis(axis, dir, name, pad, now) {
+    const h = this._held[axis];
+    if (!dir) { h.dir = 0; return; }
+    this._setDevice(padFamily(pad.id));
+    if (h.dir !== dir) { h.dir = dir; h.next = now + REPEAT_DELAY; this._fire(name, false); }
+    else if (now >= h.next) { h.next = now + REPEAT_RATE; this._fire(name, true); }
   }
 }

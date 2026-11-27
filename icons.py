@@ -41,6 +41,13 @@ _MDI_NAMES = {
     "download": "mdi6.download",
     "refresh": "mdi6.refresh",
     "chevron_down": "mdi6.chevron-down",
+    "scan_folder": "mdi6.folder-search-outline",
+    "launch": "mdi6.play",
+    "copy": "mdi6.content-copy",
+    "zoom_in": "mdi6.magnify-plus-outline",
+    "zoom_out": "mdi6.magnify-minus-outline",
+    "big_picture": "mdi6.fullscreen",
+    "enhance": "mdi6.auto-fix",
 }
 
 

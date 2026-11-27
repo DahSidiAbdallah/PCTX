@@ -1,357 +1,236 @@
-"""Centralized theme tokens and QSS for the PCSX2 Manager UI.
+"""Theme tokens and styling for PCTX's two interface modes.
 
-Visual language: the PS2's own "Browser" boot menu -- a deep navy-to-royal-blue
-backdrop, glassy rounded panels, and a bright cyan-blue glow used for accents,
-focus, and selection instead of a flat solid highlight. Single source of truth
-so the look can be adjusted from one place instead of hunting through inline
-setStyleSheet() calls scattered across main.py.
+Classic     -- modelled on PCSX2's own Qt front-end: the stock Fusion style with
+               a neutral dark palette, native-looking controls, and almost no
+               custom QSS. Anything that already looks right natively is left
+               alone on purpose.
+Big Picture -- a fullscreen, controller-first layout in the spirit of Steam's
+               Big Picture. The main screen is web/bigpicture.html; the QSS here
+               only restyles the native dialogs (Install, Settings, ...) that
+               open on top of it so they match and stay readable from a couch.
+
+Both are flat: no gradients, glows, or drop shadows.
 """
 
-# --- Color tokens ---
-# Deep navy base (used as the flat QWidget default so nested widgets don't
-# each render their own slice of a gradient -- QSS gradients are per-widget-rect,
-# so they only look right applied to a handful of large, single-instance
-# containers like the app frame/title bar/dialogs, not to QWidget globally).
-COLOR_BG = "#0a1330"
-COLOR_BG_TOP = "#050915"
-COLOR_BG_BOTTOM = "#122a63"
+from PySide6.QtGui import QColor, QPalette
 
-COLOR_SURFACE = "#132449"
-COLOR_SURFACE_ALT = "#1b3160"
-COLOR_BORDER = "#274a8c"
-COLOR_BORDER_STRONG = "#3f6ac4"
+MODE_CLASSIC = "classic"
+MODE_BIG_PICTURE = "big_picture"
 
-COLOR_ACCENT = "#2f7cf6"
-COLOR_ACCENT_HOVER = "#4f96ff"
-COLOR_ACCENT_PRESSED = "#1f5fd1"
-COLOR_GLOW = "#5ec8ff"
+# --- Shared semantic colours (status text, badges) ---
+COLOR_SUCCESS = "#3fb950"
+COLOR_WARNING = "#d29922"
+COLOR_DANGER = "#f85149"
 
-COLOR_TEXT = "#eaf2ff"
-COLOR_TEXT_MUTED = "#8fa8d6"
-COLOR_TEXT_DISABLED = "#4d5f8a"
+# --- Classic palette (PCSX2's "Dark Fusion"-style look) ---
+CLASSIC = {
+    "window": "#353535",
+    "base": "#232323",
+    "alt_base": "#2b2b2b",
+    "button": "#404040",
+    "text": "#f0f0f0",
+    "muted": "#a0a0a0",
+    "disabled": "#808080",
+    "border": "#555555",
+    "highlight": "#2a82da",
+    "chrome": "#2b2b2b",
+    "chrome_hover": "#474747",
+}
 
-COLOR_SUCCESS = "#2fd18a"
-COLOR_SUCCESS_HOVER = "#42e69c"
-COLOR_DANGER = "#ff5470"
-COLOR_WARNING = "#ffb84d"
+# --- Big Picture palette (dark slate + one bright accent, like Steam's) ---
+BIG_PICTURE = {
+    "bg": "#0e1319",
+    "surface": "#18212b",
+    "surface_alt": "#212d3a",
+    "border": "#2c3b4d",
+    "text": "#e6edf5",
+    "muted": "#8d9db0",
+    "accent": "#1a9fff",
+    "accent_text": "#ffffff",
+}
 
-# --- Spacing tokens (px) ---
+COLOR_ACCENT = CLASSIC["highlight"]
+
+# --- Spacing / geometry tokens (px) ---
 SPACING_XS = 4
 SPACING_SM = 8
 SPACING_MD = 12
 SPACING_LG = 16
-SPACING_XL = 24
 
-RADIUS_SM = 6
-RADIUS_MD = 9
-RADIUS_LG = 14
+TITLE_BAR_HEIGHT = 34
+RESIZE_MARGIN = 6
 
-FONT_FAMILY = '"Segoe UI", "Inter", sans-serif'
+# Drawn when a game has no cover art (yet). Size is the base the art is scaled from.
+COVER_WIDTH = 200
+COVER_HEIGHT = 266
+PLACEHOLDER = {"bg": "#30343a", "line": "#4b525b", "text": "#9aa3ad"}
 
-# Object names used to target specific widgets with QSS instead of scattering
-# ad-hoc setStyleSheet() calls through main.py.
+# Game-grid cover sizes (width; height keeps a 3:4 box-art ratio).
+GRID_COVER_MIN = 72
+GRID_COVER_MAX = 240
+GRID_COVER_DEFAULT = 128
+
+# Object names used to target widgets from QSS.
 OBJ_MUTED_LABEL = "mutedLabel"
 OBJ_SUCCESS_BUTTON = "successButton"
+OBJ_STATUS_SUCCESS = "statusSuccess"
+OBJ_STATUS_WARNING = "statusWarning"
+OBJ_STATUS_ERROR = "statusError"
 OBJ_OVERLAY_LABEL = "overlayLabel"
-
 OBJ_APP_FRAME = "appFrame"
 OBJ_TITLE_BAR = "titleBar"
 OBJ_TITLE_BAR_LABEL = "titleBarLabel"
 OBJ_TITLE_BAR_BUTTON = "titleBarButton"
 OBJ_TITLE_BAR_CLOSE_BUTTON = "titleBarCloseButton"
 
-OBJ_STATUS_SUCCESS = "statusSuccess"
-OBJ_STATUS_WARNING = "statusWarning"
-OBJ_STATUS_ERROR = "statusError"
 
-TITLE_BAR_HEIGHT = 38
-RESIZE_MARGIN = 6
-COVER_WIDTH = 200
-COVER_HEIGHT = 266
+def _status_label_qss() -> str:
+    return f"""
+    QLabel#{OBJ_STATUS_SUCCESS} {{ color: {COLOR_SUCCESS}; font-weight: 600; }}
+    QLabel#{OBJ_STATUS_WARNING} {{ color: {COLOR_WARNING}; font-weight: 600; }}
+    QLabel#{OBJ_STATUS_ERROR}   {{ color: {COLOR_DANGER}; font-weight: 600; }}
+    """
 
-# Reusable gradient snippets so panels/buttons/dialogs share the same glassy
-# language instead of each spelling out qlineargradient stops separately.
-_GRAD_APP_BG = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_BG_TOP}, stop:0.55 {COLOR_BG}, stop:1 {COLOR_BG_BOTTOM})"
-)
-_GRAD_PANEL = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_SURFACE_ALT}, stop:1 {COLOR_SURFACE})"
-)
-_GRAD_BUTTON = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_ACCENT_HOVER}, stop:1 {COLOR_ACCENT})"
-)
-_GRAD_BUTTON_HOVER = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_GLOW}, stop:1 {COLOR_ACCENT_HOVER})"
-)
-_GRAD_SUCCESS = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_SUCCESS_HOVER}, stop:1 {COLOR_SUCCESS})"
-)
-# Darker than _GRAD_PANEL -- closer to the near-black backdrop the boot/ring/
-# carousel screens use, so the title bar reads as part of the same "PS2
-# Browser" surface instead of a lighter, separate strip sitting on top of it.
-_GRAD_TITLE_BAR = (
-    f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-    f"stop:0 {COLOR_BG_TOP}, stop:1 {COLOR_SURFACE})"
-)
 
-DARK_QSS = f"""
-    QMainWindow {{
-        background-color: {COLOR_BG};
-    }}
-    QWidget {{
-        background-color: {COLOR_BG};
-        color: {COLOR_TEXT};
-        font-family: {FONT_FAMILY};
-    }}
-    QTabWidget::pane {{
-        border: none;
-        background-color: {COLOR_BG};
-    }}
-    QTabBar::tab {{
-        background-color: {COLOR_SURFACE};
-        color: {COLOR_TEXT_MUTED};
-        padding: 10px 22px;
-        margin-right: 2px;
-        border: none;
-        border-top-left-radius: {RADIUS_MD}px;
-        border-top-right-radius: {RADIUS_MD}px;
-        font-weight: 600;
-    }}
-    QTabBar::tab:selected {{
-        background-color: {COLOR_BG};
-        color: {COLOR_TEXT};
-        border-bottom: 2px solid {COLOR_GLOW};
-    }}
-    QTabBar::tab:hover:!selected {{
-        background-color: {COLOR_SURFACE_ALT};
-        color: {COLOR_TEXT};
-    }}
-    QLineEdit, QTextEdit, QComboBox {{
-        background-color: {COLOR_SURFACE};
-        border: 1px solid {COLOR_BORDER};
-        border-radius: {RADIUS_SM}px;
-        padding: 6px 8px;
-        color: {COLOR_TEXT};
-        selection-background-color: {COLOR_ACCENT};
-    }}
-    QLineEdit:focus, QTextEdit:focus, QComboBox:focus {{
-        border: 1px solid {COLOR_GLOW};
-    }}
-    QLineEdit:disabled, QTextEdit:disabled {{
-        color: {COLOR_TEXT_DISABLED};
-        background-color: {COLOR_SURFACE};
-    }}
-    QPushButton {{
-        background: {_GRAD_BUTTON};
-        color: white;
-        border: 1px solid {COLOR_BORDER_STRONG};
-        border-radius: {RADIUS_SM}px;
-        padding: 8px 18px;
-        font-weight: 600;
-    }}
-    QPushButton:hover {{
-        background: {_GRAD_BUTTON_HOVER};
-        border: 1px solid {COLOR_GLOW};
-    }}
-    QPushButton:pressed {{
-        background-color: {COLOR_ACCENT_PRESSED};
-    }}
-    QPushButton:disabled {{
-        background: {COLOR_SURFACE_ALT};
-        border: 1px solid {COLOR_BORDER};
-        color: {COLOR_TEXT_DISABLED};
-    }}
-    QPushButton#{OBJ_SUCCESS_BUTTON} {{
-        background: {_GRAD_SUCCESS};
-        border: 1px solid {COLOR_SUCCESS};
-    }}
-    QPushButton#{OBJ_SUCCESS_BUTTON}:hover {{
-        background: {COLOR_SUCCESS_HOVER};
-        border: 1px solid {COLOR_SUCCESS_HOVER};
-    }}
-    QGroupBox {{
-        background-color: rgba(19, 36, 73, 120);
-        border: 1px solid {COLOR_BORDER};
-        border-radius: {RADIUS_LG}px;
-        margin-top: 14px;
-        padding-top: 14px;
-        font-weight: 600;
-        color: {COLOR_TEXT};
-    }}
-    QGroupBox::title {{
-        subcontrol-origin: margin;
-        left: 12px;
-        padding: 0 6px;
-        color: {COLOR_GLOW};
-    }}
-    QLabel {{
-        color: {COLOR_TEXT_MUTED};
-    }}
-    QLabel#{OBJ_MUTED_LABEL} {{
-        color: {COLOR_TEXT_MUTED};
-        font-size: 11px;
-    }}
-    QLabel#{OBJ_OVERLAY_LABEL} {{
-        background: rgba(5, 9, 21, 0.72);
-        color: white;
-    }}
-    QListWidget, QTreeWidget, QTableWidget {{
-        background-color: {COLOR_SURFACE};
-        border: 1px solid {COLOR_BORDER};
-        border-radius: {RADIUS_SM}px;
-        color: {COLOR_TEXT};
-        alternate-background-color: {COLOR_SURFACE_ALT};
-    }}
-    QListWidget::item, QTreeWidget::item {{
-        padding: 3px 2px;
-        border-radius: {RADIUS_SM}px;
-    }}
-    QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {{
-        background-color: {COLOR_ACCENT};
-        color: white;
-        border: 1px solid {COLOR_GLOW};
-    }}
-    QListWidget::item:hover, QTreeWidget::item:hover {{
-        background-color: {COLOR_SURFACE_ALT};
-    }}
-    QHeaderView::section {{
-        background-color: {COLOR_SURFACE};
-        color: {COLOR_TEXT_MUTED};
-        border: none;
-        border-bottom: 1px solid {COLOR_BORDER};
-        padding: 6px;
-        font-weight: 600;
-    }}
-    QProgressBar {{
-        border: 1px solid {COLOR_BORDER};
-        border-radius: {RADIUS_SM}px;
-        text-align: center;
-        background-color: {COLOR_SURFACE};
-        color: {COLOR_TEXT};
-    }}
-    QProgressBar::chunk {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop:0 {COLOR_ACCENT}, stop:1 {COLOR_GLOW});
-        border-radius: {RADIUS_SM - 1}px;
-    }}
-    QScrollBar:vertical {{
-        background-color: transparent;
-        width: 12px;
-        margin: 0;
-    }}
-    QScrollBar::handle:vertical {{
-        background-color: {COLOR_BORDER_STRONG};
-        border-radius: 6px;
-        min-height: 24px;
-    }}
-    QScrollBar::handle:vertical:hover {{
-        background-color: {COLOR_GLOW};
-    }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-        height: 0;
-    }}
-    QScrollBar:horizontal {{
-        background-color: transparent;
-        height: 12px;
-        margin: 0;
-    }}
-    QScrollBar::handle:horizontal {{
-        background-color: {COLOR_BORDER_STRONG};
-        border-radius: 6px;
-        min-width: 24px;
-    }}
-    QScrollBar::handle:horizontal:hover {{
-        background-color: {COLOR_GLOW};
-    }}
-    QCheckBox {{
-        spacing: 8px;
-        color: {COLOR_TEXT};
-    }}
-    QCheckBox::indicator {{
-        width: 17px;
-        height: 17px;
-        border: 1px solid {COLOR_BORDER_STRONG};
-        border-radius: {RADIUS_SM}px;
-        background-color: {COLOR_SURFACE};
-    }}
-    QCheckBox::indicator:checked {{
-        background-color: {COLOR_GLOW};
-        border-color: {COLOR_GLOW};
-    }}
-    QMenuBar {{
-        background-color: {COLOR_BG};
-        color: {COLOR_TEXT};
-        border-bottom: 1px solid {COLOR_BORDER};
-    }}
-    QMenuBar::item:selected {{
-        background-color: {COLOR_SURFACE_ALT};
-    }}
-    QMenu {{
-        background-color: {COLOR_SURFACE};
-        color: {COLOR_TEXT};
-        border: 1px solid {COLOR_BORDER};
-    }}
-    QMenu::item:selected {{
-        background-color: {COLOR_ACCENT};
-        color: white;
-    }}
+def classic_qss() -> str:
+    c = CLASSIC
+    return f"""
     QToolTip {{
-        background-color: {COLOR_SURFACE_ALT};
-        color: {COLOR_TEXT};
-        border: 1px solid {COLOR_BORDER_STRONG};
-        padding: 4px 6px;
+        background-color: {c['alt_base']}; color: {c['text']};
+        border: 1px solid {c['border']}; padding: 3px 6px;
     }}
-    QDialog {{
-        background: {_GRAD_APP_BG};
+    QWidget#{OBJ_APP_FRAME} {{ background-color: {c['window']}; border: 1px solid #1c1c1c; }}
+    QWidget#{OBJ_TITLE_BAR} {{ background-color: {c['chrome']}; border-bottom: 1px solid #1c1c1c; }}
+    QLabel#{OBJ_TITLE_BAR_LABEL} {{ color: {c['text']}; font-weight: 600; }}
+    QMenuBar {{ background: transparent; color: {c['text']}; padding: 0px; spacing: 1px; }}
+    QMenuBar::item {{ padding: 4px 9px; margin: 0px; background: transparent; border-radius: 4px; }}
+    QMenuBar::item:selected, QMenuBar::item:pressed {{ background-color: {c['chrome_hover']}; }}
+    QToolBar QToolButton {{ border: 1px solid transparent; border-radius: 4px; padding: 3px 6px; }}
+    QToolBar QToolButton:hover {{ background-color: #444444; border-color: #4c4c4c; }}
+    QToolBar QToolButton:pressed {{ background-color: #2f2f2f; }}
+    QToolBar QToolButton:checked {{ background-color: #2b4766; border-color: {c['highlight']}; }}
+    QLineEdit {{ background-color: {c['base']}; border: 1px solid {c['border']}; border-radius: 4px; padding: 4px 7px;
+        selection-background-color: {c['highlight']}; }}
+    QLineEdit:focus {{ border-color: {c['highlight']}; }}
+    QListWidget::item {{ border-radius: 4px; padding: 4px; }}
+    QListWidget::item:hover {{ background-color: rgba(255, 255, 255, 18); }}
+    QListWidget::item:selected {{ background-color: {c['highlight']}; color: #ffffff; }}
+    QSlider::groove:horizontal {{ height: 4px; background: #262626; border-radius: 2px; }}
+    QSlider::sub-page:horizontal {{ background: {c['highlight']}; border-radius: 2px; }}
+    QSlider::handle:horizontal {{ background: #e8e8e8; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
+    QSlider::handle:horizontal:hover {{ background: #ffffff; }}
+    QToolButton#{OBJ_TITLE_BAR_BUTTON} {{ background: transparent; border: none; border-radius: 3px; }}
+    QToolButton#{OBJ_TITLE_BAR_BUTTON}:hover {{ background-color: {c['chrome_hover']}; }}
+    QToolButton#{OBJ_TITLE_BAR_CLOSE_BUTTON} {{ background: transparent; border: none; border-radius: 3px; }}
+    QToolButton#{OBJ_TITLE_BAR_CLOSE_BUTTON}:hover {{ background-color: #c42b1c; }}
+    QLabel#{OBJ_MUTED_LABEL} {{ color: {c['muted']}; }}
+    QLabel#{OBJ_OVERLAY_LABEL} {{ background-color: rgba(0, 0, 0, 150); color: white; }}
+    QPushButton#{OBJ_SUCCESS_BUTTON} {{
+        background-color: #2e7d32; border: 1px solid #1b5e20; border-radius: 3px; color: white; font-weight: 600; padding: 5px 16px;
     }}
-    QWidget#{OBJ_APP_FRAME} {{
-        background: {_GRAD_APP_BG};
-        border: 1px solid {COLOR_BORDER_STRONG};
+    QPushButton#{OBJ_SUCCESS_BUTTON}:hover {{ background-color: #388e3c; }}
+    QPushButton#{OBJ_SUCCESS_BUTTON}:disabled {{ background-color: {c['button']}; color: {c['disabled']}; border-color: {c['border']}; }}
+    QToolBar {{ spacing: 4px; padding: 3px; border: none; border-bottom: 1px solid #1c1c1c; }}
+    QStatusBar {{ border-top: 1px solid #1c1c1c; }}
+    QStatusBar::item {{ border: none; }}
+    """ + _status_label_qss()
+
+
+def big_picture_qss() -> str:
+    b = BIG_PICTURE
+    return f"""
+    QWidget {{ background-color: {b['bg']}; color: {b['text']}; font-size: 15px; }}
+    QDialog, QMessageBox {{ background-color: {b['bg']}; }}
+    QLabel {{ background: transparent; }}
+    QLabel#{OBJ_MUTED_LABEL} {{ color: {b['muted']}; font-size: 13px; }}
+    QLabel#{OBJ_OVERLAY_LABEL} {{ background-color: rgba(0, 0, 0, 150); color: white; }}
+    QToolTip {{ background-color: {b['surface_alt']}; color: {b['text']}; border: 1px solid {b['border']}; padding: 4px 8px; }}
+    QPushButton {{
+        background-color: {b['surface_alt']}; color: {b['text']};
+        border: 1px solid {b['border']}; border-radius: 4px;
+        padding: 10px 22px; min-height: 22px; font-weight: 600;
     }}
-    QWidget#{OBJ_TITLE_BAR} {{
-        background: {_GRAD_TITLE_BAR};
-        border-bottom: 1px solid rgba(94, 200, 255, 90);
+    QPushButton:hover, QPushButton:focus {{ background-color: {b['accent']}; border-color: {b['accent']}; color: {b['accent_text']}; }}
+    QPushButton:pressed {{ background-color: #1486dd; }}
+    QPushButton:disabled {{ background-color: {b['surface']}; color: {b['muted']}; border-color: {b['border']}; }}
+    QPushButton#{OBJ_SUCCESS_BUTTON} {{ background-color: #2f8f3a; border-color: #2f8f3a; color: white; }}
+    QPushButton#{OBJ_SUCCESS_BUTTON}:hover, QPushButton#{OBJ_SUCCESS_BUTTON}:focus {{ background-color: #3fb950; border-color: #3fb950; }}
+    QPushButton#{OBJ_SUCCESS_BUTTON}:disabled {{ background-color: {b['surface']}; color: {b['muted']}; border-color: {b['border']}; }}
+    QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {{
+        background-color: {b['surface']}; border: 1px solid {b['border']};
+        border-radius: 4px; padding: 8px 10px; selection-background-color: {b['accent']};
     }}
-    QLabel#{OBJ_TITLE_BAR_LABEL} {{
-        color: {COLOR_GLOW};
-        font-weight: 600;
+    QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {b['accent']}; }}
+    QComboBox QAbstractItemView {{ background-color: {b['surface']}; selection-background-color: {b['accent']}; border: 1px solid {b['border']}; }}
+    QGroupBox {{ border: 1px solid {b['border']}; border-radius: 6px; margin-top: 14px; padding-top: 12px; font-weight: 600; }}
+    QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; color: {b['muted']}; }}
+    QListWidget, QTreeWidget, QTableWidget {{
+        background-color: {b['surface']}; border: 1px solid {b['border']}; border-radius: 4px;
+        alternate-background-color: {b['surface_alt']};
     }}
-    QToolButton#{OBJ_TITLE_BAR_BUTTON} {{
-        background-color: transparent;
-        border: 1px solid transparent;
-        border-radius: {RADIUS_SM}px;
-    }}
-    QToolButton#{OBJ_TITLE_BAR_BUTTON}:hover {{
-        background-color: {COLOR_SURFACE_ALT};
-        border: 1px solid {COLOR_GLOW};
-    }}
-    QToolButton#{OBJ_TITLE_BAR_BUTTON}:pressed {{
-        background-color: {COLOR_BORDER_STRONG};
-    }}
-    QToolButton#{OBJ_TITLE_BAR_CLOSE_BUTTON} {{
-        background-color: transparent;
-        border: 1px solid transparent;
-        border-radius: {RADIUS_SM}px;
-    }}
-    QToolButton#{OBJ_TITLE_BAR_CLOSE_BUTTON}:hover {{
-        background-color: {COLOR_DANGER};
-        border: 1px solid {COLOR_DANGER};
-    }}
-    QLabel#{OBJ_STATUS_SUCCESS} {{
-        color: {COLOR_SUCCESS};
-        font-weight: 600;
-    }}
-    QLabel#{OBJ_STATUS_WARNING} {{
-        color: {COLOR_WARNING};
-        font-weight: 600;
-    }}
-    QLabel#{OBJ_STATUS_ERROR} {{
-        color: {COLOR_DANGER};
-        font-weight: 600;
-    }}
-"""
+    QListWidget::item, QTreeWidget::item {{ padding: 8px 6px; }}
+    QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {{ background-color: {b['accent']}; color: white; }}
+    QHeaderView::section {{ background-color: {b['surface_alt']}; color: {b['muted']}; border: none; padding: 8px; font-weight: 600; }}
+    QCheckBox, QRadioButton {{ spacing: 10px; }}
+    QCheckBox::indicator {{ width: 20px; height: 20px; border: 1px solid {b['border']}; border-radius: 4px; background-color: {b['surface']}; }}
+    QCheckBox::indicator:checked {{ background-color: {b['accent']}; border-color: {b['accent']}; }}
+    QProgressBar {{ border: 1px solid {b['border']}; border-radius: 4px; text-align: center; background-color: {b['surface']}; }}
+    QProgressBar::chunk {{ background-color: {b['accent']}; }}
+    QScrollBar:vertical {{ background: transparent; width: 12px; margin: 0; }}
+    QScrollBar::handle:vertical {{ background-color: {b['border']}; border-radius: 6px; min-height: 28px; }}
+    QScrollBar::handle:vertical:hover {{ background-color: {b['accent']}; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+    QMenu {{ background-color: {b['surface']}; border: 1px solid {b['border']}; padding: 4px; }}
+    QMenu::item {{ padding: 8px 22px; border-radius: 3px; }}
+    QMenu::item:selected {{ background-color: {b['accent']}; color: white; }}
+    """ + _status_label_qss()
+
+
+def qss_for(mode: str) -> str:
+    return big_picture_qss() if mode == MODE_BIG_PICTURE else classic_qss()
+
+
+def palette_for(mode: str) -> QPalette:
+    p = QPalette()
+    if mode == MODE_BIG_PICTURE:
+        b = BIG_PICTURE
+        window, base, alt, text = b["bg"], b["surface"], b["surface_alt"], b["text"]
+        button, highlight, disabled = b["surface_alt"], b["accent"], b["muted"]
+        muted = b["muted"]
+    else:
+        c = CLASSIC
+        window, base, alt, text = c["window"], c["base"], c["alt_base"], c["text"]
+        button, highlight, disabled = c["button"], c["highlight"], c["disabled"]
+        muted = c["muted"]
+    p.setColor(QPalette.Window, QColor(window))
+    p.setColor(QPalette.WindowText, QColor(text))
+    p.setColor(QPalette.Base, QColor(base))
+    p.setColor(QPalette.AlternateBase, QColor(alt))
+    p.setColor(QPalette.ToolTipBase, QColor(alt))
+    p.setColor(QPalette.ToolTipText, QColor(text))
+    p.setColor(QPalette.Text, QColor(text))
+    p.setColor(QPalette.PlaceholderText, QColor(muted))
+    p.setColor(QPalette.Button, QColor(button))
+    p.setColor(QPalette.ButtonText, QColor(text))
+    p.setColor(QPalette.BrightText, QColor("#ffffff"))
+    p.setColor(QPalette.Link, QColor(highlight))
+    p.setColor(QPalette.Highlight, QColor(highlight))
+    p.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, role, QColor(disabled))
+    return p
+
+
+def apply_theme(app, mode: str) -> None:
+    """Install the palette + stylesheet for `mode` application-wide, so every
+    top-level dialog (not just children of the main window) picks it up.
+
+    Re-applying an application stylesheet re-polishes every widget, which is
+    the slowest single step of startup, so asking for the mode that's already
+    installed is a no-op."""
+    if app.property("pctx_theme") == mode:
+        return
+    app.setProperty("pctx_theme", mode)
+    app.setStyle("Fusion")
+    app.setPalette(palette_for(mode))
+    app.setStyleSheet(qss_for(mode))

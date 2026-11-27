@@ -14,7 +14,9 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QMenu, QInputDialog, QScrollArea,
 )
 from PySide6.QtWidgets import *
+import html
 import re
+import threading
 import json
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
@@ -24,17 +26,14 @@ import logging
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QCoreApplication, QPoint, QPointF, QRectF, QEventLoop, QUrl
 import sys
-from PySide6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QAction, QPainter, QColor, QPen, QDesktopServices
+from PySide6.QtGui import (QIcon, QPixmap, QDragEnterEvent, QDropEvent, QAction, QActionGroup, QPainter,
+                           QColor, QPen, QDesktopServices, QKeySequence, QShortcut)
 import concurrent.futures
 
-# The app's own icon (a cropped, text-free version of logo.png -- square and
-# legible at the small sizes a taskbar/title bar actually render it at,
-# unlike the full logo with its "PCSX2 PATCH & TEXTURE MANAGER" wordmark).
-# .ico (multi-resolution) for setWindowIcon()/the OS taskbar, .png for the
-# small in-title-bar pixmap where a single fixed size is fine.
+# Application icon: multi-resolution .ico with hand-tuned small sizes (see
+# tools/build_icons.py), used for the window, taskbar and title bar.
 _ASSETS_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_ICON_ICO_PATH = os.path.join(_ASSETS_DIR, "app_icon.ico")
-APP_ICON_PATH = os.path.join(_ASSETS_DIR, "app_icon.png")
 
 # ---------------------------- Windows native window-chrome support ----------------------------
 # Qt's Qt.FramelessWindowHint strips the window styles Windows' own Snap feature
@@ -91,13 +90,28 @@ def set_windows_app_user_model_id():
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "PCSX2-Manager.PatchTextureManager.1"
+            "PCTX.PatchTextureManager.2"
         )
     except Exception:
         pass
 
 # Registry to keep running QThread-based workers alive if callers don't hold a reference
 _ACTIVE_WORKERS: list = []
+
+
+def release_worker_when_done(worker: QThread, on_done) -> None:
+    """Call `on_done` on the main thread once `worker` has really finished.
+
+    Several worker classes shadow QThread.finished with their own result signal,
+    emitted from inside run() while the thread is still alive. Cleaning up on that
+    one (dropping the last reference / deleteLater) destroys the QThread under a
+    running thread, which aborts the whole process. This hooks QThread's own
+    end-of-thread signal instead and queues the callback onto the main thread.
+    """
+    def _done():
+        worker.wait(2000)
+        on_done()
+    super(type(worker), worker).finished.connect(_done, Qt.QueuedConnection)
 
 # Ensure any remaining QThread workers are asked to quit and waited on at process exit to
 # reduce "QThread: Destroyed while thread '' is still running" warnings and possible
@@ -133,9 +147,16 @@ import cheat_online
 from cheat_online import fetch_and_cache_cheats
 import theme
 import icons
-import effects
 import texture_upscale
-import ps2_ui
+import bigpicture
+import disc
+import enhancements
+import texture_catalog
+import patches_online
+# Imported here, on the main thread, on purpose: textures_install pulls in py7zr, whose
+# `import multiprocessing` can deadlock when it is first executed on a worker thread
+# (PackInstallWorker used to do exactly that, hanging the install forever).
+import textures_install  # noqa: F401
 from bs4 import BeautifulSoup
 
 # ---------------------------- Helpers / Model ----------------------------
@@ -145,6 +166,43 @@ logger = logging.getLogger("pcsx2_manager")
 if not logger.handlers:
     # default to WARNING to reduce noisy logs; callers can enable INFO/DEBUG when needed
     logging.basicConfig(level=logging.WARNING)
+
+# ---------------------------- App identity / settings ----------------------------
+APP_NAME = "PCTX"
+APP_VERSION = "2.0.0"
+USER_AGENT = "PCTX/2.0"
+# The app was called "PCSX2 Manager" before the PCTX rename, and its settings
+# (PCSX2 paths, profiles, welcome flag, ...) lived under that name. Those are
+# copied across once so renaming doesn't silently reset anyone's setup. The
+# on-disk data files in the home folder (.pcsx2_manager_*) keep their names for
+# the same reason -- renaming them would orphan existing libraries and caches.
+_LEGACY_SETTINGS = ("PCSX2-Manager", "PatchTextureManager")
+
+
+def app_settings() -> QSettings:
+    """The app's persistent settings. PCTX_SETTINGS_FILE redirects them to an INI
+    file instead of the Windows registry -- used by the tests and screenshot
+    scripts so they can never touch a real user's settings."""
+    override = os.environ.get("PCTX_SETTINGS_FILE")
+    if override:
+        return QSettings(override, QSettings.IniFormat)
+    return QSettings(APP_NAME, APP_NAME)
+
+
+def migrate_legacy_settings(old: QSettings, new: QSettings) -> int:
+    """One-time copy of every key from the pre-rename settings store into the
+    PCTX one. Never overwrites a key PCTX already has. Returns how many keys
+    were copied (0 if it already ran, or there was nothing to copy)."""
+    if new.value("migrated_from_legacy", False, bool):
+        return 0
+    copied = 0
+    for key in old.allKeys():
+        if not new.contains(key):
+            new.setValue(key, old.value(key))
+            copied += 1
+    new.setValue("migrated_from_legacy", True)
+    new.sync()
+    return copied
 
 
 def fmt_speed(bps: Optional[float]) -> str:
@@ -222,6 +280,9 @@ class GameEntry:
     title: str = ""
     crc: Optional[str] = None
     source_path: Optional[str] = None
+    # Where `crc` came from: 'disc' (read from the image -- exact), or a
+    # database name. Anything but 'disc' may belong to another revision.
+    crc_source: Optional[str] = None
 
 
 @dataclass
@@ -261,18 +322,21 @@ def default_pcsx2_user_dirs(pcsx2_exe: str = "") -> List[str]:
 
 
 def ensure_subdirs(base: str) -> dict:
+    """PCSX2's folders under its data folder. Only the ones this app installs
+    into are created; logs/ and inis/ belong to PCSX2 and are just reported."""
     paths = {
         "cheats": os.path.join(base, "cheats"),
-        "cheats_ws": os.path.join(base, "cheats_ws"),
+        "patches": os.path.join(base, "patches"),
         "textures": os.path.join(base, "textures"),
         "logs": os.path.join(base, "logs"),
         "inis": os.path.join(base, "inis"),
     }
-    for p in paths.values():
-        try:
-            os.makedirs(p, exist_ok=True)
-        except Exception:
-            pass
+    if os.path.isdir(base):
+        for key in ("cheats", "patches", "textures"):
+            try:
+                os.makedirs(paths[key], exist_ok=True)
+            except OSError:
+                pass
     return paths
 
 
@@ -590,17 +654,17 @@ def create_library_cover_placeholder(serial: str = "", found: Optional[bool] = N
     """
     w, h = theme.COVER_WIDTH, theme.COVER_HEIGHT
     pm = QPixmap(w, h)
-    pm.fill(QColor(theme.COLOR_SURFACE_ALT))
+    pm.fill(QColor(theme.PLACEHOLDER['bg']))
     try:
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
-        pen = QPen(QColor(theme.COLOR_BORDER_STRONG))
+        pen = QPen(QColor(theme.PLACEHOLDER['line']))
         pen.setWidthF(1.5)
         p.setPen(pen)
         cx, cy = w / 2, h / 2 - 16
         p.drawEllipse(QPointF(cx, cy), 30, 30)
         p.drawEllipse(QPointF(cx, cy), 9, 9)
-        p.setPen(QColor(theme.COLOR_TEXT_MUTED))
+        p.setPen(QColor(theme.PLACEHOLDER['text']))
         font = p.font()
         font.setPointSize(9)
         p.setFont(font)
@@ -612,63 +676,58 @@ def create_library_cover_placeholder(serial: str = "", found: Optional[bool] = N
     return pm
 
 
+_TITLE_INDEX: Optional[Dict[str, str]] = None
+_TITLE_INDEX_LOCK = threading.Lock()
+_ROW_RE = re.compile(r"<tr\b(.*?)</tr>", re.S | re.I)
+_TD_RE = re.compile(r"<td\b([^>]*)>(.*?)</td>", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _cell_text(raw: str) -> str:
+    return " ".join(html.unescape(_TAG_RE.sub(" ", raw)).replace("\xa0", " ").split())
+
+
+def _bundled_title_index() -> Dict[str, str]:
+    """serial -> title from the bundled PSXDataCenter lists, built once.
+
+    The lists are ~3 MB of HTML; parsing them with BeautifulSoup on every lookup
+    used to cost several seconds per call (and ran on the UI thread at startup).
+    A row scan with regexes builds the whole index in a fraction of a second."""
+    global _TITLE_INDEX
+    with _TITLE_INDEX_LOCK:
+        if _TITLE_INDEX is not None:
+            return _TITLE_INDEX
+        index: Dict[str, str] = {}
+        for name in ('ulist2.html', 'plist2.html', 'jlist2.html'):
+            path = os.path.join(_ASSETS_DIR, name)
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    doc = fh.read()
+            except OSError:
+                continue
+            for row in _ROW_RE.finditer(doc):
+                cells = [(attrs, _cell_text(body)) for attrs, body in _TD_RE.findall(row.group(1))]
+                serials = [tok for _a, t in cells for tok in t.upper().split() if SERIAL_RE.fullmatch(tok)]
+                if not serials:
+                    continue
+                title = next((t for a, t in cells if re.search(r"col7|col3", a, re.I) and t), "")
+                if not title:
+                    rest = [(t, "") for _a, t in cells if t and not any(x in t.upper() for x in serials)]
+                    if rest:
+                        title = max(rest, key=lambda c: _score_title_candidate(*c))[0]
+                if not title or title.upper() in ('INFO', 'TITLE', 'N/A', 'UNKNOWN'):
+                    continue
+                for ser in serials:
+                    index.setdefault(ser, title)
+        _TITLE_INDEX = index
+        return index
+
+
 def bundled_lookup_title(serial: str) -> Optional[str]:
-    """Search local bundled PSXDataCenter HTML files for a serial and return the title if found."""
+    """Title for a serial from the bundled PSXDataCenter lists, or None."""
     if not serial:
         return None
-    s_norm = serial.upper().strip()
-    files = ['ulist2.html', 'plist2.html', 'jlist2.html']
-    for fname in files:
-        if not os.path.isfile(fname):
-            continue
-        try:
-            with open(fname, 'r', encoding='utf-8', errors='replace') as fh:
-                soup = BeautifulSoup(fh, 'html.parser')
-        except Exception:
-            try:
-                with open(fname, 'r', encoding='windows-1252', errors='replace') as fh:
-                    soup = BeautifulSoup(fh, 'html.parser')
-            except Exception:
-                continue
-        # Look for a td that contains the serial string exactly (allow variants)
-        for td in soup.find_all('td'):
-            txt = td.get_text(' ', strip=True)
-            txt_u = txt.upper()
-            if not txt:
-                continue
-            # exact match or contains but tokenized
-            if s_norm in txt_u.split() or txt_u == s_norm:
-                # find parent row
-                tr = td.find_parent('tr')
-                if not tr:
-                    continue
-                # prefer td with class col7 or col3 or nearest non-serial td
-                title = None
-                # Prefer col7/col3 cells which typically hold titles
-                t = tr.find('td', attrs={'class': re.compile(r'col7|col3', re.I)})
-                if t:
-                    title = t.get_text(' ', strip=True)
-                if not title:
-                    # fallback: pick the best td text in the row excluding the serial cell
-                    candidates = []  # list of (text, html)
-                    for ctd in tr.find_all('td'):
-                        ctxt = ctd.get_text(' ', strip=True)
-                        if not ctxt:
-                            continue
-                        if s_norm in ctxt.upper():
-                            continue
-                        candidates.append((ctxt, str(ctd)))
-                    if candidates:
-                        # prefer candidates using common heuristics and HTML context
-                        scored = [(_score_title_candidate(text, html), text) for (text, html) in candidates]
-                        scored.sort(reverse=True)
-                        title = scored[0][1]
-                if title:
-                    # sanitize
-                    t = title.strip()
-                    if t and t.upper() not in ('INFO', 'TITLE', 'N/A', 'UNKNOWN'):
-                        return t
-    return None
+    return _bundled_title_index().get(serial.upper().strip())
 
 
 # ---- Shared local cheats database (loaded once, used by CheatsTab and LibraryView) ----
@@ -754,7 +813,7 @@ def write_cheats_pnach(title: str, serial: str, crc: str, cheats: List[dict], ch
         f"// {title}",
         f"// Serial: {serial}",
         f"// CRC: {crc}",
-        f"// Generated by PCSX2 Manager",
+        f"// Generated by PCTX",
         f"// {len(cheats)} cheat(s)",
         "",
         "gametitle=" + title,
@@ -831,7 +890,7 @@ def fetch_github_pnach_cheats(crc: str) -> List[dict]:
     for path in _GITHUB_PNACH_COLLECTIONS:
         url = f"https://raw.githubusercontent.com/{path}/{crc_upper}.pnach"
         try:
-            resp = requests.get(url, timeout=10, headers={'User-Agent': 'PCSX2-Manager/1.0'})
+            resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
             if resp.status_code == 200 and resp.text.strip():
                 cheats = parse_pnach_cheats(resp.text)
                 if cheats:
@@ -903,7 +962,7 @@ def resolve_texture_release_asset(entry: dict) -> Optional[Tuple[str, str, str]]
     try:
         resp = requests.get(
             f'https://api.github.com/repos/{repo}/releases/latest',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'PCSX2-Manager/1.0'},
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': USER_AGENT},
             timeout=10,
         )
         if resp.status_code != 200:
@@ -955,11 +1014,11 @@ def search_github_texture_packs(serial: str, title: str) -> Tuple[List[dict], Op
     """
     if requests is None or not title:
         return [], None
-    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'PCSX2-Manager/1.0'}
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': USER_AGENT}
     try:
         resp = requests.get(
             'https://api.github.com/search/repositories',
-            params={'q': f'{title} pcsx2 texture', 'per_page': 8},
+            params={'q': f'{title} texture in:name,description,readme', 'per_page': 10},
             headers=headers, timeout=10,
         )
         if resp.status_code == 403:
@@ -980,7 +1039,7 @@ def search_github_texture_packs(serial: str, title: str) -> Tuple[List[dict], Op
                 'verified': False,
             })
         candidates.sort(key=lambda c: -c.get('stars', 0))
-        return candidates[:6], None
+        return candidates[:10], None
     except Exception as e:
         logger.debug(f"[textures] GitHub search failed: {e}")
         return [], f"GitHub search failed: {e}"
@@ -1009,11 +1068,14 @@ def search_archive_org_texture_packs(serial: str, title: str) -> Tuple[List[dict
         resp = requests.get(
             'https://archive.org/advancedsearch.php',
             params={
-                'q': f'title:("{title}") AND (pcsx2 OR ps2) AND (texture OR hd)',
+                # Title words anywhere, a PS2 mention, and an explicit texture
+                # word; videos and music are never packs.
+                'q': (f'("{title}") AND (pcsx2 OR ps2 OR "playstation 2") AND '
+                      f'(texture OR textures OR retexture OR upscale OR upscaled) AND NOT mediatype:(movies OR audio)'),
                 'fl[]': ['identifier', 'title', 'description'],
-                'rows': 8, 'page': 1, 'output': 'json',
+                'rows': 12, 'page': 1, 'output': 'json',
             },
-            headers={'User-Agent': 'PCSX2-Manager/1.0'}, timeout=10,
+            headers={'User-Agent': USER_AGENT}, timeout=10,
         )
         if resp.status_code != 200:
             return [], f"Internet Archive search returned HTTP {resp.status_code}."
@@ -1033,7 +1095,7 @@ def search_archive_org_texture_packs(serial: str, title: str) -> Tuple[List[dict
                 'url': f'https://archive.org/details/{identifier}',
                 'verified': False,
             })
-        return candidates[:6], None
+        return candidates[:10], None
     except Exception as e:
         logger.debug(f"[textures] Internet Archive search failed: {e}")
         return [], f"Internet Archive search failed: {e}"
@@ -1050,7 +1112,7 @@ def resolve_archive_org_asset(identifier: str, asset_pattern: str = '') -> Optio
     try:
         resp = requests.get(
             f'https://archive.org/metadata/{identifier}',
-            headers={'User-Agent': 'PCSX2-Manager/1.0'}, timeout=10,
+            headers={'User-Agent': USER_AGENT}, timeout=10,
         )
         if resp.status_code != 200:
             return None
@@ -1540,7 +1602,7 @@ def build_pnach(pd: PnachData) -> str:
             for addr, val in codes:
                 out.append(f"patch=1,EE,{addr},extended,{val}")
     out.append("")
-    out.append("// Generated by PCSX2 Patch & Texture Manager")
+    out.append("// Generated by PCTX")
     return "\n".join(out).strip() + "\n"
 
 
@@ -1570,7 +1632,7 @@ class ResolveWorker(QThread):
         psx_crc_map = {}
         # Use local HTML files placed next to the script: ulist2.html, plist2.html, jlist2.html
         if self.use_bundled_lists:
-            urls = ['ulist2.html', 'plist2.html', 'jlist2.html']
+            urls = [os.path.join(_ASSETS_DIR, n) for n in ('ulist2.html', 'plist2.html', 'jlist2.html')]
             for url in urls:
                 for enc in ('utf-8', 'windows-1252', 'shift_jis'):
                     try:
@@ -1758,7 +1820,7 @@ class CheatsTab(QWidget):
             except ValueError:
                 pass
             worker.deleteLater()
-        worker.finished.connect(_cleanup)
+        release_worker_when_done(worker, _cleanup)
         worker.start()
 
     def _preview_context_menu(self, pos):
@@ -2357,7 +2419,7 @@ class CheatsTab(QWidget):
         rb_replace = QRadioButton('Replace editor')
 
         # Load stored preference for append/replace
-        settings = QSettings('PCSX2-Manager', 'PatchTextureManager')
+        settings = app_settings()
         pref = settings.value('fetch_dialog/mode', 'append')
         if pref == 'replace':
             rb_replace.setChecked(True)
@@ -3200,6 +3262,9 @@ class TexturesTab(QWidget):
             try:
                 _ACTIVE_WORKERS.append(self)
                 def _on_finish():
+                    # Runs on the main thread (queued below). Make sure the thread has fully
+                    # unwound before the last reference to it goes away.
+                    self.wait(2000)
                     try:
                         _ACTIVE_WORKERS.remove(self)
                     except Exception:
@@ -3208,7 +3273,11 @@ class TexturesTab(QWidget):
                         self.deleteLater()
                     except Exception:
                         pass
-                self.finished.connect(_on_finish)
+                # QThread's own end-of-thread signal, NOT self.finished: that name is shadowed by this
+                # class's (installed, failures) result signal, which is emitted from inside run() while the
+                # thread is still alive. Cleaning up on it deleted the QThread object under a running thread
+                # ("QThread: Destroyed while thread is still running" -> process abort).
+                super().finished.connect(_on_finish, Qt.QueuedConnection)
             except Exception:
                 pass
             super().start()
@@ -3243,9 +3312,16 @@ class TexturesTab(QWidget):
         
         self._build_ui()
         
-        # Defer initial scan until after UI is fully initialized
-        # This prevents threading issues during startup
-        QTimer.singleShot(100, self._deferred_scan)
+        # The installed-packs list walks every pack folder on disk. It's only
+        # visible in the Texture Manager window, so scan the first time that
+        # window is shown instead of on every app start.
+        self._initial_scan_done = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initial_scan_done:
+            self._initial_scan_done = True
+            QTimer.singleShot(0, self._deferred_scan)
 
     def _preview_context_menu(self, pos):
         # Context menu for preview cover in TexturesTab
@@ -3534,7 +3610,7 @@ class TexturesTab(QWidget):
             worker.fetch_failed.connect(_cleanup)
         except Exception:
             try:
-                worker.finished.connect(_cleanup)
+                release_worker_when_done(worker, _cleanup)
             except Exception:
                 pass
         worker.start()
@@ -3659,7 +3735,7 @@ class TexturesTab(QWidget):
         try:
             # allow a global override via QSettings under key 'staging/imports_root'
             from PySide6.QtCore import QSettings
-            qs = QSettings()
+            qs = app_settings()
             cfg = qs.value('staging/imports_root', '')
             if cfg:
                 return os.path.expanduser(cfg)
@@ -3698,7 +3774,7 @@ class TexturesTab(QWidget):
             if d:
                 try:
                     from PySide6.QtCore import QSettings
-                    qs = QSettings()
+                    qs = app_settings()
                     qs.setValue('staging/imports_root', os.path.expanduser(d))
                     QMessageBox.information(self, 'Staging folder', f'Staging folder set to:\n{d}')
                 except Exception:
@@ -5498,172 +5574,175 @@ class TexturesTab(QWidget):
         return None
 
 
+def ini_get_bool(ini_path: str, key: str, section: str) -> Optional[bool]:
+    """Read a true/false value from a PCSX2 .ini (None if the file, section or
+    key isn't there). PCSX2 writes bools as the literal strings true/false."""
+    try:
+        in_section = False
+        with open(ini_path, 'r', encoding='utf-8', errors='replace') as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith('[') and line.endswith(']'):
+                    in_section = line[1:-1].strip().lower() == section.lower()
+                elif in_section and '=' in line:
+                    k, v = line.split('=', 1)
+                    if k.strip().lower() == key.lower():
+                        return v.strip().lower() == 'true'
+    except OSError:
+        return None
+    return None
+
+
+def ini_set_bool(ini_path: str, key: str, val: bool, section: str) -> bool:
+    """Write a bool the way PCSX2 itself does -- confirmed against its actual
+    write path (INISettingsInterface::SetBoolValue -> SimpleIni), which always
+    serializes bools as the literal strings "true"/"false", never 1/0 or
+    enabled/disabled, under a proper [Section] header. Anything else produces a
+    line current PCSX2 simply doesn't recognize. Returns False if the file
+    can't be read or written."""
+    try:
+        if not os.path.isfile(ini_path):
+            return False
+        with open(ini_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        target = f"{key} = {'true' if val else 'false'}\n"
+        header = f"[{section}]"
+        start, end = None, len(lines)
+        for i, line in enumerate(lines):
+            if line.strip().lower() == header.lower():
+                start = i
+                for j in range(i + 1, len(lines)):
+                    s = lines[j].strip()
+                    if s.startswith('[') and s.endswith(']'):
+                        end = j
+                        break
+                break
+        if start is None:
+            if lines and not lines[-1].endswith('\n'):
+                lines[-1] += '\n'
+            lines += [f"\n{header}\n", target]
+        else:
+            for i in range(start + 1, end):
+                k = lines[i].split('=', 1)[0].strip().lower()
+                if '=' in lines[i] and k == key.lower():
+                    lines[i] = target
+                    break
+            else:
+                lines.insert(end, target)
+        with open(ini_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        return True
+    except OSError:
+        return False
+
+
+# (label, tooltip, ini section, ini key) -- what the Settings "PCSX2 options" checkboxes control
+PCSX2_OPTIONS = [
+    ("Enable cheats", "Lets PCSX2 load the cheat files this app installs.", "EmuCore", "EnableCheats"),
+    ("Enable widescreen patches", "Applies each game's 'Widescreen 16:9' patch (installed with Patches & Fixes).",
+     "EmuCore", "EnableWideScreenPatches"),
+    ("Enable no-interlacing patches", "Applies each game's 'No-Interlacing' patch where one exists.",
+     "EmuCore", "EnableNoInterlacingPatches"),
+    ("Enable texture replacement", "Lets PCSX2 load the texture packs this app installs.",
+     "EmuCore/GS", "LoadTextureReplacements"),
+    ("Dump textures while playing",
+     "PCSX2 saves a game's original textures to disk as you play it, so the Install dialog can AI-upscale "
+     "them (Real-ESRGAN) when no ready-made pack exists. Turn off again afterwards -- it slows PCSX2 down.",
+     "EmuCore/GS", "DumpReplaceableTextures"),
+]
+
+
 class SettingsTab(QWidget):
+    """Where PCSX2 is and which of its options this app relies on.
+
+    The checkboxes are not stored by this app: they read and write PCSX2's own
+    PCSX2.ini, so what you see is what PCSX2 will actually do.
+    """
+
     def __init__(self, parent: 'MainWindow'):
         super().__init__()
         self.parent = parent
         self.paths: Dict[str, str] = {}
         self._build_ui()
-
-    def _build_ui(self):
-        # Create a scroll area for the entire tab content
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        
-        # Create a container widget for all content
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG)
-        layout.setSpacing(theme.SPACING_MD)
-        
-        # Main settings
-        grp = QGroupBox("PCSX2 Installation")
-        fl = QFormLayout(grp)
-        self.user_dir = QLineEdit()
-        self.user_dir.setToolTip("The main PCSX2 user data folder")
-        self.btn_browse = QPushButton("Browse…")
-        self.btn_browse.clicked.connect(self._browse)
-        self.btn_detect = QPushButton("Auto-detect")
-        self.btn_detect.setToolTip("Automatically find your PCSX2 folder")
-        self.btn_detect.clicked.connect(self._detect)
-        fl.addRow("User folder:", self._row(self.user_dir, self.btn_browse, self.btn_detect))
-        layout.addWidget(grp)
-
-        # Detected subfolders (simplified, collapsible)
-        subgrp = QGroupBox("Detected Folders")
-        subgrp.setCheckable(True)
-        subgrp.setChecked(True)  # Expand by default to show detected paths
-        fl2 = QFormLayout(subgrp)
-        self.cheats_label = QLabel("")
-        self.cheatsws_label = QLabel("")
-        self.textures_label = QLabel("")
-        self.logs_label = QLabel("")
-        fl2.addRow("Cheats:", self.cheats_label)
-        fl2.addRow("Cheats WS:", self.cheatsws_label)
-        fl2.addRow("Textures:", self.textures_label)
-        fl2.addRow("Logs:", self.logs_label)
-        layout.addWidget(subgrp)
-
-        # Quick actions
-        quick_grp = QGroupBox("Quick Actions")
-        quick_layout = QVBoxLayout()
-        
-        self.btn_enable_cheats = QPushButton("Enable Cheats in PCSX2")
-        self.btn_enable_cheats.setMinimumHeight(35)
-        self.btn_enable_cheats.setToolTip("Automatically enable cheats in PCSX2.ini")
-        self.btn_enable_cheats.clicked.connect(self._toggle_cheats_ini)
-        
-        self.btn_enable_textures = QPushButton("Enable Texture Replacement")
-        self.btn_enable_textures.setMinimumHeight(35)
-        self.btn_enable_textures.setToolTip("Automatically enable texture replacement in PCSX2.ini")
-        self.btn_enable_textures.clicked.connect(self._toggle_textures_ini)
-
-        self.btn_enable_dumping = QPushButton("Enable Texture Dumping (for AI Upscale)")
-        self.btn_enable_dumping.setMinimumHeight(35)
-        self.btn_enable_dumping.setToolTip(
-            "Lets PCSX2 save a game's original textures to disk while you play it. "
-            "The Install dialog can turn those into an AI-upscaled pack (Real-ESRGAN) "
-            "for games with no ready-made texture pack available."
-        )
-        self.btn_enable_dumping.clicked.connect(self._toggle_texture_dumping_ini)
-
-        quick_layout.addWidget(self.btn_enable_cheats)
-        quick_layout.addWidget(self.btn_enable_textures)
-        quick_layout.addWidget(self.btn_enable_dumping)
-        quick_grp.setLayout(quick_layout)
-        layout.addWidget(quick_grp)
-
-        # Advanced integrations (collapsible)
-        cfg = QGroupBox("Advanced Integrations")
-        cfg.setCheckable(True)
-        cfg.setChecked(False)
-        cfgl = QFormLayout(cfg)
-        
-        self.pcsx2_exe = QLineEdit()
-        self.pcsx2_exe.setPlaceholderText("Path to pcsx2.exe (optional)")
-        self.pcsx2_exe.setToolTip("PCSX2 executable for quick launch")
-        self.pcsx2_exe.editingFinished.connect(self._save_pcsx2_exe)
-        btn_pcsx2 = QPushButton("Browse…")
-        btn_pcsx2.clicked.connect(lambda: self._pick_file(self.pcsx2_exe))
-        self.btn_launch = QPushButton("Launch PCSX2")
-        self.btn_launch.clicked.connect(self._launch_pcsx2)
-
-        cfgl.addRow("PCSX2 exe:", self._row(self.pcsx2_exe, btn_pcsx2, self.btn_launch))
-        layout.addWidget(cfg)
-
-        # Profiles (collapsible)
-        prof = QGroupBox("Game Profiles")
-        prof.setCheckable(True)
-        prof.setChecked(False)
-        prof.setToolTip("Save game configurations for quick access")
-        pfl = QVBoxLayout(prof)
-        
-        profile_form = QWidget()
-        profile_form_layout = QFormLayout(profile_form)
-        self.profile_title = QLineEdit()
-        self.profile_serial = QLineEdit()
-        self.profile_crc = QLineEdit()
-        profile_form_layout.addRow("Title:", self.profile_title)
-        profile_form_layout.addRow("Serial:", self.profile_serial)
-        profile_form_layout.addRow("CRC:", self.profile_crc)
-        pfl.addWidget(profile_form)
-        
-        profile_btns = QWidget()
-        profile_btns_layout = QHBoxLayout(profile_btns)
-        profile_btns_layout.setContentsMargins(0, 0, 0, 0)
-        self.btn_profile_save = QPushButton("Save Profile")
-        self.btn_profile_save.clicked.connect(self._save_profile)
-        self.btn_profile_export = QPushButton("Export")
-        self.btn_profile_export.clicked.connect(self._export_profiles)
-        self.btn_profile_import = QPushButton("Import")
-        self.btn_profile_import.clicked.connect(self._import_profiles)
-        profile_btns_layout.addWidget(self.btn_profile_save)
-        profile_btns_layout.addWidget(self.btn_profile_export)
-        profile_btns_layout.addWidget(self.btn_profile_import)
-        pfl.addWidget(profile_btns)
-        
-        self.profiles_list = QListWidget()
-        self.profiles: Dict[str, Dict] = {}
-        self.profiles_list.itemSelectionChanged.connect(self._load_selected_profile)
-        pfl.addWidget(self.profiles_list)
-        
-        layout.addWidget(prof)
-
-        layout.addStretch(1)
-        
-        # Set the container as the scroll area's widget
-        scroll.setWidget(container)
-        
-        # Set the scroll area as the main layout for this tab
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(scroll)
-
         self._load_settings()
 
+    # ---- UI ----
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG)
+        layout.setSpacing(theme.SPACING_MD)
+
+        grp = QGroupBox("PCSX2")
+        form = QFormLayout(grp)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self.pcsx2_exe = QLineEdit()
+        self.pcsx2_exe.setPlaceholderText("Optional -- only needed to launch games from here")
+        self.pcsx2_exe.editingFinished.connect(self._save_pcsx2_exe)
+        btn_exe = QPushButton("Browse…")
+        btn_exe.clicked.connect(self._browse_exe)
+        form.addRow("Program:", self._row(self.pcsx2_exe, btn_exe))
+
+        self.user_dir = QLineEdit()
+        self.user_dir.setPlaceholderText("Folder that contains PCSX2's cheats, patches, textures and inis")
+        self.user_dir.editingFinished.connect(self._update_subs)
+        btn_dir = QPushButton("Browse…")
+        btn_dir.clicked.connect(self._browse)
+        btn_detect = QPushButton("Detect")
+        btn_detect.setToolTip("Find PCSX2's data folder automatically")
+        btn_detect.clicked.connect(self._detect)
+        btn_open = QPushButton("Open")
+        btn_open.setToolTip("Show the data folder in Explorer")
+        btn_open.clicked.connect(self._open_user_dir)
+        form.addRow("Data folder:", self._row(self.user_dir, btn_dir, btn_detect, btn_open))
+
+        self.folder_label = QLabel("")
+        self.folder_label.setWordWrap(True)
+        form.addRow("", self.folder_label)
+        layout.addWidget(grp)
+
+        opts = QGroupBox("PCSX2 options")
+        ol = QVBoxLayout(opts)
+        self.option_boxes: Dict[Tuple[str, str], QCheckBox] = {}
+        for label, tip, section, key in PCSX2_OPTIONS:
+            cb = QCheckBox(label)
+            cb.setToolTip(tip)
+            cb.toggled.connect(lambda on, s=section, k=key: self._set_option(s, k, on))
+            self.option_boxes[(section, key)] = cb
+            ol.addWidget(cb)
+        self.options_note = QLabel("")
+        self.options_note.setObjectName(theme.OBJ_MUTED_LABEL)
+        self.options_note.setWordWrap(True)
+        ol.addWidget(self.options_note)
+        layout.addWidget(opts)
+        layout.addStretch(1)
+
     def _row(self, *widgets):
+        """A line edit followed by its buttons: the edit takes the spare width."""
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         for wd in widgets:
-            h.addWidget(wd)
-        h.addStretch(1)
+            h.addWidget(wd, 1 if isinstance(wd, QLineEdit) else 0)
         return w
 
-    def _pick_file(self, line: QLineEdit):
-        p, _ = QFileDialog.getOpenFileName(self, "Select file", os.path.expanduser("~"), "All files (*.*)")
+    # ---- PCSX2 program ----
+    def _browse_exe(self):
+        flt = "Programs (*.exe);;All files (*)" if IS_WINDOWS else "All files (*)"
+        p, _ = QFileDialog.getOpenFileName(self, "Select the PCSX2 program", self.pcsx2_exe.text() or os.path.expanduser("~"), flt)
         if p:
-            line.setText(p)
-            if line is self.pcsx2_exe:
-                self._save_pcsx2_exe()
-                self._offer_portable_switch(p)
+            self.pcsx2_exe.setText(p)
+            self._save_pcsx2_exe()
+            self._offer_portable_switch(p)
+
+    def _save_pcsx2_exe(self):
+        app_settings().setValue('paths/pcsx2_exe', self.pcsx2_exe.text().strip())
 
     def _offer_portable_switch(self, pcsx2_exe: str):
         """If the PCSX2 exe just picked has a portable.ini next to it, that's the
         *real* data folder (portable installs never touch Documents\\PCSX2) --
         offer to switch to it rather than silently leaving a possibly-wrong
-        folder configured, which would make sync write cheats PCSX2 never sees."""
+        folder configured, which would make installs write files PCSX2 never sees."""
         exe_dir = os.path.dirname(os.path.abspath(pcsx2_exe))
         if not os.path.isfile(os.path.join(exe_dir, "portable.ini")):
             return
@@ -5671,222 +5750,103 @@ class SettingsTab(QWidget):
         if os.path.normcase(current) == os.path.normcase(exe_dir):
             return
         reply = QMessageBox.question(
-            self, "Portable PCSX2 Detected",
-            f"This looks like a portable PCSX2 install (portable.ini found next to the exe).\n\n"
-            f"Portable installs keep cheats/textures/etc. next to the executable, not in "
-            f"Documents\\PCSX2 -- use this folder instead?\n\n{exe_dir}",
+            self, "Portable PCSX2 detected",
+            "This looks like a portable PCSX2 install (portable.ini is next to the program).\n\n"
+            "Portable installs keep their cheats, patches and textures next to the program, not in "
+            f"Documents\\PCSX2. Use this folder instead?\n\n{exe_dir}",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
         if reply == QMessageBox.Yes:
             self.user_dir.setText(exe_dir)
             self._update_subs()
 
+    # ---- data folder ----
     def _browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Select PCSX2 user directory", self.user_dir.text() or os.path.expanduser("~"))
+        d = QFileDialog.getExistingDirectory(self, "Select PCSX2's data folder", self.user_dir.text() or os.path.expanduser("~"))
         if d:
             self.user_dir.setText(d)
             self._update_subs()
 
     def _detect(self):
         guesses = default_pcsx2_user_dirs(self.pcsx2_exe.text().strip())
-        base = guesses[0] if guesses else os.path.join(os.path.expanduser("~"), "Documents", "PCSX2")
-        self.user_dir.setText(base)
+        if not guesses:
+            QMessageBox.information(self, "Data folder", "Couldn't find PCSX2's data folder. Start PCSX2 once so it "
+                                    "creates it, or choose the folder yourself.")
+            return
+        self.user_dir.setText(guesses[0])
         self._update_subs()
+
+    def _open_user_dir(self):
+        d = self.user_dir.text().strip()
+        if d and os.path.isdir(d):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+    def _ini_path(self) -> str:
+        return os.path.join(self.paths.get('inis', ''), 'PCSX2.ini')
 
     def _update_subs(self):
         base = self.user_dir.text().strip()
-        self.paths = ensure_subdirs(base)
-        self.cheats_label.setText(self.paths["cheats"])
-        self.cheatsws_label.setText(self.paths["cheats_ws"])
-        self.textures_label.setText(self.paths["textures"])
-        self.logs_label.setText(self.paths["logs"])
+        self.paths = ensure_subdirs(base) if base else {}
         self.parent.state.pcsx2_paths = self.paths
+        self._refresh_folder_status()
+        self._refresh_options()
+        app_settings().setValue('paths/user_dir', base)
         self.parent.paths_changed.emit(self.paths)
-        self._save_user_dir()
 
-    # --- Persistence (QSettings) ---
-    def _qsettings(self) -> QSettings:
-        return QSettings('PCSX2-Manager', 'PatchTextureManager')
+    def folder_status(self) -> Tuple[str, str]:
+        """(message, object-name) describing the configured data folder."""
+        base = self.user_dir.text().strip()
+        if not base:
+            text, kind = "Choose PCSX2's data folder to install cheats, patches and textures.", theme.OBJ_STATUS_WARNING
+        elif not os.path.isdir(base):
+            text, kind = "That folder doesn't exist.", theme.OBJ_STATUS_ERROR
+        elif os.path.isfile(self._ini_path()):
+            text, kind = "PCSX2 found. Installed files go into its cheats, patches and textures folders.", theme.OBJ_STATUS_SUCCESS
+        else:
+            text, kind = ("No inis/PCSX2.ini in this folder yet. Installing still works, but start PCSX2 once "
+                          "so the options below can be changed.", theme.OBJ_STATUS_WARNING)
+        return text, kind
 
+    def _refresh_folder_status(self):
+        text, kind = self.folder_status()
+        self.folder_label.setText(text)
+        self.folder_label.setObjectName(kind)
+        self.folder_label.style().unpolish(self.folder_label)
+        self.folder_label.style().polish(self.folder_label)
+
+    # ---- PCSX2.ini options ----
+    def _refresh_options(self):
+        ini = self._ini_path()
+        have_ini = os.path.isfile(ini)
+        for (section, key), cb in self.option_boxes.items():
+            cb.blockSignals(True)
+            cb.setChecked(bool(have_ini and ini_get_bool(ini, key, section)))
+            cb.setEnabled(have_ini)
+            cb.blockSignals(False)
+        self.options_note.setText(
+            "Close PCSX2 before changing these -- it rewrites its settings file when it exits." if have_ini
+            else "Available once PCSX2.ini exists (start PCSX2 once).")
+
+    def _set_option(self, section: str, key: str, on: bool):
+        if not ini_set_bool(self._ini_path(), key, on, section):
+            QMessageBox.warning(self, "PCSX2 options", "Couldn't write PCSX2.ini. Is the data folder correct?")
+            self._refresh_options()
+
+    # ---- persistence ----
     def _load_settings(self):
-        s = self._qsettings()
-        saved_exe = s.value('paths/pcsx2_exe', '', str)
-        if saved_exe:
-            self.pcsx2_exe.setText(saved_exe)
+        s = app_settings()
+        exe = s.value('paths/pcsx2_exe', '', str)
+        if exe:
+            self.pcsx2_exe.setText(exe)
         saved_dir = s.value('paths/user_dir', '', str)
         if saved_dir:
             self.user_dir.setText(saved_dir)
             self._update_subs()
         else:
-            self._detect()
-        saved_profiles = s.value('profiles/data', '', str)
-        if saved_profiles:
-            try:
-                self.profiles = json.loads(saved_profiles)
-                self._refresh_profiles()
-            except Exception:
-                pass
-
-    def _save_user_dir(self):
-        self._qsettings().setValue('paths/user_dir', self.user_dir.text().strip())
-
-    def _save_pcsx2_exe(self):
-        self._qsettings().setValue('paths/pcsx2_exe', self.pcsx2_exe.text().strip())
-
-    def _save_profiles(self):
-        try:
-            self._qsettings().setValue('profiles/data', json.dumps(self.profiles))
-        except Exception:
-            pass
-
-    # INI toggles (best-effort; may vary by version)
-    def _ini_set_bool(self, ini_path: str, key: str, val: bool, section: Optional[str] = None):
-        """Write a bool the way PCSX2 itself does -- confirmed against its actual
-        write path (INISettingsInterface::SetBoolValue -> SimpleIni), which always
-        serializes bools as the literal strings "true"/"false", never 1/0 or
-        enabled/disabled, under a proper [Section] header. Writing anything else
-        (as this used to) produces a line current PCSX2 simply doesn't recognize."""
-        try:
-            if not os.path.isfile(ini_path):
-                return False
-            with open(ini_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-            target_line = f"{key} = {'true' if val else 'false'}\n"
-
-            if section is None:
-                for i, line in enumerate(lines):
-                    s = line.strip().lower()
-                    if s.startswith(key.lower() + "=") or s.startswith(key.lower() + " ="):
-                        lines[i] = target_line
-                        break
-                else:
-                    lines.append(target_line)
-                with open(ini_path, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                return True
-
-            section_header = f"[{section}]"
-            section_start = None
-            section_end = len(lines)
-            for i, line in enumerate(lines):
-                if line.strip().lower() == section_header.lower():
-                    section_start = i
-                    section_end = len(lines)
-                    for j in range(i + 1, len(lines)):
-                        s = lines[j].strip()
-                        if s.startswith('[') and s.endswith(']'):
-                            section_end = j
-                            break
-                    break
-
-            if section_start is None:
-                if lines and not lines[-1].endswith('\n'):
-                    lines[-1] += '\n'
-                lines.append(f"\n{section_header}\n")
-                lines.append(target_line)
-            else:
-                key_line_idx = None
-                for i in range(section_start + 1, section_end):
-                    s = lines[i].strip().lower()
-                    if s.startswith(key.lower() + "=") or s.startswith(key.lower() + " ="):
-                        key_line_idx = i
-                        break
-                if key_line_idx is not None:
-                    lines[key_line_idx] = target_line
-                else:
-                    lines.insert(section_end, target_line)
-
-            with open(ini_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            return True
-        except Exception:
-            return False
-
-    def _toggle_cheats_ini(self):
-        ini = os.path.join(self.paths.get('inis',''), 'PCSX2.ini')
-        ok = self._ini_set_bool(ini, 'EnableCheats', True, section='EmuCore')
-        QMessageBox.information(self, "Cheats", "Cheats enabled." if ok else "Could not modify INI (path/version mismatch).")
-
-    def _toggle_textures_ini(self):
-        ini = os.path.join(self.paths.get('inis',''), 'PCSX2.ini')
-        ok = self._ini_set_bool(ini, 'LoadTextureReplacements', True, section='EmuCore/GS')
-        QMessageBox.information(self, "Textures", "Texture replacement enabled." if ok else "Could not modify INI (path/version mismatch).")
-
-    def _toggle_texture_dumping_ini(self):
-        ini = os.path.join(self.paths.get('inis', ''), 'PCSX2.ini')
-        ok = self._ini_set_bool(ini, 'DumpReplaceableTextures', True, section='EmuCore/GS')
-        QMessageBox.information(
-            self, "Texture Dumping",
-            ("Texture dumping enabled. Play the game briefly so PCSX2 writes its textures to "
-             "disk -- after that, the Install dialog can offer an AI upscale (Real-ESRGAN) for "
-             "it if no ready-made texture pack is found.")
-            if ok else "Could not modify INI (path/version mismatch)."
-        )
-
-    def _launch_pcsx2(self):
-        exe = self.pcsx2_exe.text().strip()
-        if not exe:
-            QMessageBox.information(self, "PCSX2", "Set pcsx2 executable path first.")
-            return
-        try:
-            subprocess.Popen([exe])
-        except Exception as e:
-            QMessageBox.critical(self, "Launch error", str(e))
-
-    # Profiles
-    def _save_profile(self):
-        title = self.profile_title.text().strip()
-        serial = self.profile_serial.text().strip().upper()
-        crc = (self.profile_crc.text().strip().upper() if HEX8.match(self.profile_crc.text().strip()) else '')
-        if not (title or serial or crc):
-            QMessageBox.information(self, "Profile", "Provide at least a title, serial or CRC.")
-            return
-        key = crc or serial or title
-        self.profiles[key] = {"title": title, "serial": serial, "crc": crc}
-        self._refresh_profiles()
-        self._save_profiles()
-
-    def _refresh_profiles(self):
-        self.profiles_list.clear()
-        for k, v in sorted(self.profiles.items()):
-            t = v.get('title') or ''
-            s = v.get('serial') or ''
-            c = v.get('crc') or ''
-            self.profiles_list.addItem(QListWidgetItem(f"{t}  [{s}]  ({c})"))
-
-    def _load_selected_profile(self):
-        idx = self.profiles_list.currentRow()
-        if idx < 0: return
-        key = list(sorted(self.profiles.keys()))[ idx ]
-        v = self.profiles[key]
-        self.profile_title.setText(v.get('title',''))
-        self.profile_serial.setText(v.get('serial',''))
-        self.profile_crc.setText(v.get('crc',''))
-        # Also push to Cheats tab fields for convenience
-        self.parent.cheats_tab.title_edit.setText(v.get('title',''))
-        self.parent.cheats_tab.serial_edit.setText(v.get('serial',''))
-        self.parent.cheats_tab.crc_edit.setText(v.get('crc',''))
-
-    def _export_profiles(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Profiles", os.path.expanduser("~"), "JSON (*.json)")
-        if not path: return
-        try:
-            with open(path, 'w', encoding='utf-8') as f: json.dump(self.profiles, f, ensure_ascii=False, indent=2)
-            QMessageBox.information(self, "Profiles", "Exported.")
-        except Exception as e:
-            QMessageBox.critical(self, "Export error", str(e))
-
-    def _import_profiles(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import Profiles", os.path.expanduser("~"), "JSON (*.json)")
-        if not path: return
-        try:
-            with open(path, 'r', encoding='utf-8') as f: self.profiles = json.load(f)
-            self._refresh_profiles()
-            self._save_profiles()
-
-            QMessageBox.information(self, "Profiles", "Imported.")
-        except Exception as e:
-            QMessageBox.critical(self, "Import error", str(e))
+            guesses = default_pcsx2_user_dirs(exe)
+            if guesses:
+                self.user_dir.setText(guesses[0])
+            self._update_subs()
 
 
 class ResizableFrame(QWidget):
@@ -5958,7 +5918,9 @@ class ResizableFrame(QWidget):
 
 
 class TitleBar(QWidget):
-    """Custom-drawn, draggable title bar replacing the native OS chrome."""
+    """Custom-drawn, draggable title bar replacing the native OS chrome. Holds
+    the app icon and name, the menu bar (so Classic mode doesn't spend a second
+    row on it), and the window controls."""
 
     def __init__(self, window: 'MainWindow'):
         super().__init__(window)
@@ -5968,31 +5930,27 @@ class TitleBar(QWidget):
         self.setMouseTracking(True)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 0, 6, 0)
-        layout.setSpacing(4)
+        layout.setContentsMargins(10, 0, 6, 1)
+        layout.setSpacing(8)
 
+        # Everything in the bar is centred on the same line: QMenuBar draws its
+        # items from its own top edge, so it must not be stretched to the bar's
+        # full height (that is what left the menus sitting higher than the name).
         icon_label = QLabel()
-        icon_label.setPixmap(QIcon(APP_ICON_PATH).pixmap(20, 20))
-        layout.addWidget(icon_label)
+        icon_label.setPixmap(QIcon(APP_ICON_ICO_PATH).pixmap(18, 18))
+        layout.addWidget(icon_label, 0, Qt.AlignVCenter)
 
-        title_label = QLabel("PCSX2 Manager")
+        title_label = QLabel(APP_NAME)
         title_label.setObjectName(theme.OBJ_TITLE_BAR_LABEL)
-        layout.addWidget(title_label)
+        layout.addWidget(title_label, 0, Qt.AlignVCenter)
+        layout.addSpacing(6)
 
-        self.btn_menu = self._make_button("menu", "Menu")
-        self.btn_menu.setPopupMode(QToolButton.InstantPopup)
-        self.btn_menu.setMenu(self._window.build_app_menu())
-        layout.addWidget(self.btn_menu)
+        self.menu_bar = QMenuBar()
+        self.menu_bar.setNativeMenuBar(False)
+        self.menu_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout.addWidget(self.menu_bar, 0, Qt.AlignVCenter)
 
         layout.addStretch(1)
-
-        self.btn_home = self._make_button("home", "Back to Main Menu")
-        self.btn_home.clicked.connect(self._window.show_ring_menu)
-        layout.addWidget(self.btn_home)
-
-        self.btn_settings = self._make_button("settings", "Settings")
-        self.btn_settings.clicked.connect(self._window.open_settings_dialog)
-        layout.addWidget(self.btn_settings)
 
         self.btn_min = self._make_button("minimize", "Minimize")
         self.btn_min.clicked.connect(self._window.showMinimized)
@@ -6002,22 +5960,18 @@ class TitleBar(QWidget):
         self.btn_max.clicked.connect(self._toggle_maximize)
         layout.addWidget(self.btn_max)
 
-        self.btn_close = self._make_button("close", "Close", glow_color=theme.COLOR_DANGER)
+        self.btn_close = self._make_button("close", "Close")
         self.btn_close.setObjectName(theme.OBJ_TITLE_BAR_CLOSE_BUTTON)
         self.btn_close.clicked.connect(self._window.close)
         layout.addWidget(self.btn_close)
 
-    def _make_button(self, icon_name, tooltip, glow_color=theme.COLOR_GLOW):
+    def _make_button(self, icon_name, tooltip):
         b = QToolButton()
         b.setIcon(icons.tab_icon(icon_name))
         b.setToolTip(tooltip)
         b.setObjectName(theme.OBJ_TITLE_BAR_BUTTON)
-        b.setFixedSize(30, 26)
+        b.setFixedSize(32, 24)
         b.setCursor(Qt.ArrowCursor)
-        # Same animated hover glow used on the library's toolbar buttons --
-        # keeps the title bar in the same visual language as the rest of the
-        # PS2-Browser-styled UI instead of the old flat native-Qt hover.
-        effects.add_hover_glow(b, color=glow_color, max_blur=14)
         return b
 
     def _toggle_maximize(self):
@@ -6136,24 +6090,32 @@ class GameScanWorker(QThread):
         seen = set()
 
         for i, path in enumerate(paths, 1):
+            if self.isInterruptionRequested():
+                break
             fname = os.path.basename(path)
             serial = None
             m = SERIAL_RE.search(fname)
             if m:
                 serial = m.group(0).upper().replace('_', '-').replace(' ', '-')
-            elif path.lower().endswith('.iso'):
-                serial = read_iso_serial(path)
+            # The disc itself is the authority: its SYSTEM.CNF names the real
+            # serial and its boot ELF gives the exact CRC PCSX2 will use.
+            info = None if path.lower().endswith('.chd') else disc.read_disc_info(path)
+            if info and info.serial:
+                serial = info.serial
             if serial and serial not in seen:
                 seen.add(serial)
                 title = bundled_lookup_title(serial) or os.path.splitext(fname)[0]
-                entries.append(GameEntry(serial=serial, title=title, crc=None, source_path=path))
+                crc = info.crc if info else None
+                entries.append(GameEntry(serial=serial, title=title, crc=crc, source_path=path,
+                                         crc_source='disc' if crc else None))
             self.progressed.emit(i, total)
 
         self.finished.emit(entries, len(paths))
 
 
 def _entry_to_dict(g: GameEntry) -> dict:
-    return {"serial": g.serial, "title": g.title, "crc": g.crc, "source_path": g.source_path}
+    return {"serial": g.serial, "title": g.title, "crc": g.crc, "source_path": g.source_path,
+            "crc_source": g.crc_source}
 
 
 def _dict_to_entry(d: dict) -> GameEntry:
@@ -6162,308 +6124,656 @@ def _dict_to_entry(d: dict) -> GameEntry:
         title=d.get('title', ''),
         crc=d.get('crc'),
         source_path=d.get('source_path'),
+        crc_source=d.get('crc_source') or (None if not d.get('crc') else 'database'),
     )
 
 
-class AIUpscaleWorker(QThread):
-    """Runs the (potentially multi-minute) Real-ESRGAN download + batch-upscale
-    off the GUI thread. LibraryView drives it with a QEventLoop so the calling
-    method can stay a plain synchronous function that returns a result string,
-    matching the rest of the install flow, while a progress dialog still
-    repaints during the wait."""
+class EnhancementsDialog(QDialog):
+    """Classic: everything that makes a game better in PCSX2, in one place.
 
-    progress = Signal(str)
-    done = Signal(bool, str)
+    Patches & fixes, cheats and texture packs each get a tab showing what's
+    available, what's installed and what's switched on; a Recommended button
+    picks the safe improvements; a Checks tab lists anything in PCSX2's own
+    settings that would stop them from working. Nothing changes until Apply.
+    The choices come back as one `selection()` dict, the same shape Big
+    Picture sends, so both modes apply through the same code."""
 
-    def __init__(self, src_dir: str, dst_dir: str, tools_dir: str, scale: int = 4, parent=None):
+    KIND_ORDER = ("widescreen", "nointerlace", "fix", "fps", "quality", "other")
+
+    def __init__(self, game: 'GameEntry', o: dict, parent=None):
         super().__init__(parent)
-        self.src_dir = src_dir
-        self.dst_dir = dst_dir
-        self.tools_dir = tools_dir
-        self.scale = scale
+        self.o = o
+        self.game = game
+        self.setWindowTitle(f"Enhancements · {game.title or game.serial}")
+        self.resize(760, 640)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        # ---- header ----
+        head = QLabel(f"<span style='font-size:15pt; font-weight:600'>{html.escape(game.title or game.serial)}</span>")
+        lay.addWidget(head)
+        crc_note = ("read from your disc image" if game.crc_source == 'disc'
+                    else f"from {game.crc_source}" if game.crc else "unknown")
+        sub = QLabel(f"{game.serial}  ·  CRC {game.crc or '—'} ({crc_note})")
+        sub.setObjectName(theme.OBJ_MUTED_LABEL)
+        lay.addWidget(sub)
+
+        # ---- recommended ----
+        rec = o["recommendation"]
+        rec_box = QFrame()
+        rec_box.setObjectName("recommendBox")
+        rec_box.setStyleSheet("QFrame#recommendBox { background: #2b3a4a; border: 1px solid #3d5a78; border-radius: 6px; }")
+        rl = QHBoxLayout(rec_box)
+        rl.setContentsMargins(12, 8, 8, 8)
+        rec_text = QLabel("<b>Recommended:</b> " + (html.escape("; ".join(rec.summary)) if rec.summary
+                                                    else "nothing extra is needed for this game."))
+        rec_text.setWordWrap(True)
+        rl.addWidget(rec_text, 1)
+        self.btn_rec = QPushButton("Use recommended")
+        self.btn_rec.setEnabled(bool(rec.summary))
+        self.btn_rec.clicked.connect(self.apply_recommended)
+        rl.addWidget(self.btn_rec)
+        lay.addWidget(rec_box)
+
+        self.tabs = QTabWidget()
+        lay.addWidget(self.tabs, 1)
+        self._build_patches_tab()
+        self._build_cheats_tab()
+        self._build_textures_tab()
+        self._build_checks_tab()
+
+        log_btn = QPushButton("What was searched…")
+        log_btn.setFlat(True)
+        log_btn.clicked.connect(self._show_log)
+        bottom = QHBoxLayout()
+        bottom.addWidget(log_btn)
+        bottom.addStretch(1)
+        self.btns = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
+        self.ok_btn = self.btns.button(QDialogButtonBox.Apply)
+        self.ok_btn.setObjectName(theme.OBJ_SUCCESS_BUTTON)
+        self.ok_btn.setDefault(True)
+        self.ok_btn.clicked.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        bottom.addWidget(self.btns)
+        lay.addLayout(bottom)
+
+        # First visit: start from the recommendation. Otherwise show what's on now.
+        nothing_installed = not (o["cheats_installed"] or o["textures_installed"] or any(p["installed"] for p in o["patches"]))
+        if nothing_installed and rec.summary:
+            self.apply_recommended()
+
+    # ---- patches ----
+    def _build_patches_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        if not self.o["patches"]:
+            v.addWidget(self._note("PCSX2's patch collection has nothing for this game. It may simply not need any."))
+            v.addStretch(1)
+        else:
+            v.addWidget(self._note("Widescreen, no-interlacing and bug-fix patches from PCSX2's own collection. "
+                                   "Ticked patches are installed and switched on for this game only."))
+            self.patch_tree = QTreeWidget()
+            self.patch_tree.setHeaderLabels(["Patch", "Type", "Notes"])
+            self.patch_tree.setRootIsDecorated(True)
+            self.patch_tree.header().setStretchLastSection(True)
+            self.patch_tree.setColumnWidth(0, 300)
+            self.patch_tree.setColumnWidth(1, 120)
+            for i, p in enumerate(self.o["patches"]):
+                pf = p["file"]
+                top = QTreeWidgetItem([f"{pf.serial} · CRC {pf.crc}" + ("   (your disc)" if p["exact"] else ""),
+                                       "Update available" if p.get("update") else "Installed" if p["installed"] else "",
+                                       "Apply to update it" if p.get("update") else ""])
+                top.setFirstColumnSpanned(False)
+                f = top.font(0)
+                f.setBold(True)
+                top.setFont(0, f)
+                self.patch_tree.addTopLevelItem(top)
+                if p["always"]:
+                    it = QTreeWidgetItem(["Always-on fixes", "Game fix", "Applied whenever this file is installed"])
+                    it.setData(0, Qt.UserRole, (i, "*"))
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                    it.setCheckState(0, Qt.Checked if p["installed"] else Qt.Unchecked)
+                    top.addChild(it)
+                for g in sorted(p["groups"], key=lambda g: self.KIND_ORDER.index(g.kind)):
+                    it = QTreeWidgetItem([g.name, enhancements.KIND_LABEL[g.kind] + ("  ★" if g.recommended else ""),
+                                          g.description or (f"by {g.author}" if g.author else "")])
+                    it.setToolTip(2, g.description)
+                    it.setData(0, Qt.UserRole, (i, g.name))
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                    it.setCheckState(0, Qt.Checked if g.enabled else Qt.Unchecked)
+                    top.addChild(it)
+                top.setExpanded(p["exact"] or len(self.o["patches"]) == 1)
+            v.addWidget(self.patch_tree, 1)
+            legend = self._note("★ recommended.  Frame-rate unlocks and visual tweaks are offered but not recommended: "
+                                "they can change how fast the game runs or how it looks.")
+            v.addWidget(legend)
+            if any(p["installed"] for p in self.o["patches"]):
+                self.remove_patches = QCheckBox("Remove the installed patch files for this game")
+                v.addWidget(self.remove_patches)
+        self.tabs.addTab(w, icons.tab_icon("download"), "Patches && Fixes")
+
+    # ---- cheats ----
+    def _build_cheats_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        cheats = self.o["cheats"]
+        self.cheats_list = QListWidget()
+        self.cheats_overwrite_cb = None
+        if not cheats:
+            v.addWidget(self._note("No cheats were found for this game in any source."))
+            v.addStretch(1)
+        else:
+            v.addWidget(self._note(f"{len(cheats)} cheat(s) {self.o['cheat_note']}. All of them are written to the "
+                                   "cheat file; only the ticked ones are switched on, and you can change that later "
+                                   "here or in PCSX2."))
+            row = QHBoxLayout()
+            self.cheat_filter = QLineEdit()
+            self.cheat_filter.setPlaceholderText("Filter cheats…")
+            self.cheat_filter.textChanged.connect(self._filter_cheats)
+            row.addWidget(self.cheat_filter, 1)
+            for label, state in (("All", True), ("None", False)):
+                b = QPushButton(label)
+                b.clicked.connect(lambda _c=False, s=state: self._set_all_cheats(s))
+                row.addWidget(b)
+            v.addLayout(row)
+            for c in cheats:
+                it = QListWidgetItem(c.get("name") or "Cheat")
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Checked if c.get("enabled") else Qt.Unchecked)
+                it.setToolTip("\n".join(x for x in (c.get("description"), f"Source: {c.get('source', '')}") if x))
+                self.cheats_list.addItem(it)
+            v.addWidget(self.cheats_list, 1)
+            if self.o.get("cheats_foreign"):
+                self.cheats_overwrite_cb = QCheckBox("Replace my existing cheat file (it wasn't made by PCTX)")
+                v.addWidget(self.cheats_overwrite_cb)
+        if self.o["cheats_installed"]:
+            self.remove_cheats = QCheckBox("Remove the cheat file for this game")
+            v.addWidget(self.remove_cheats)
+        self.tabs.addTab(w, icons.tab_icon("cheats") if hasattr(icons, "tab_icon") else QIcon(), "Cheats")
+
+    def _filter_cheats(self, text: str):
+        t = text.strip().lower()
+        for i in range(self.cheats_list.count()):
+            it = self.cheats_list.item(i)
+            it.setHidden(bool(t) and t not in it.text().lower())
+
+    def _set_all_cheats(self, on: bool):
+        for i in range(self.cheats_list.count()):
+            it = self.cheats_list.item(i)
+            if not it.isHidden():
+                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    # ---- textures ----
+    def _build_textures_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        tex = self.o["textures"]
+        self.texture_list = QListWidget()
+        self.textures_overwrite_cb = None
+        self.texture_list.addItem(QListWidgetItem("Don't install a texture pack"))
+        for t in tex:
+            conf = enhancements.CONFIDENCE_LABEL.get(t.get("confidence"), "")
+            it = QListWidgetItem(f"{texture_candidate_label(t)}      [{conf}]" if conf else texture_candidate_label(t))
+            if t.get("confidence") in ("verified", "high"):
+                it.setForeground(QColor(theme.COLOR_SUCCESS))
+            elif t.get("confidence") == "low":
+                it.setForeground(QColor(theme.CLASSIC["muted"]))
+            it.setToolTip(t.get("description") or t.get("url") or "")
+            self.texture_list.addItem(it)
+        self.texture_list.setCurrentRow(0)
+        if tex:
+            v.addWidget(self._note("Best matches first. Verified packs are hand-checked; search results are ranked by how "
+                                   "closely they match this game, and unrelated hits are hidden."))
+        else:
+            v.addWidget(self._note("No texture pack was found for this game. If you turn on \"Dump textures while "
+                                   "playing\" in Settings and play for a while, PCTX can AI-upscale the game's own textures."))
+        v.addWidget(self.texture_list, 1)
+        if self.o["textures_installed"]:
+            self.textures_overwrite_cb = QCheckBox("Replace the installed pack with the one selected above")
+            v.addWidget(self.textures_overwrite_cb)
+            self.remove_textures = QCheckBox("Remove the installed texture pack")
+            v.addWidget(self.remove_textures)
+        self.tabs.addTab(w, icons.tab_icon("textures") if hasattr(icons, "tab_icon") else QIcon(), "Texture Packs")
+
+    # ---- checks ----
+    def _build_checks_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.fix_boxes: Dict[str, QCheckBox] = {}
+        colors = {"ok": theme.COLOR_SUCCESS, "warn": theme.COLOR_WARNING, "error": theme.COLOR_DANGER}
+        warn = 0
+        for c in self.o["checks"]:
+            row = QHBoxLayout()
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {colors.get(c.level, theme.CLASSIC['muted'])};")
+            dot.setAlignment(Qt.AlignTop)
+            row.addWidget(dot)
+            lbl = QLabel(c.text)
+            lbl.setWordWrap(True)
+            row.addWidget(lbl, 1)
+            if c.fix:
+                cb = QCheckBox(c.fix_label)
+                cb.setChecked(True)
+                self.fix_boxes[c.fix] = cb
+                row.addWidget(cb)
+            warn += c.level in ("warn", "error")
+            v.addLayout(row)
+        v.addStretch(1)
+        self.tabs.addTab(w, "Checks" + (f" ({warn})" if warn else ""))
+
+    # ---- helpers ----
+    @staticmethod
+    def _note(text: str) -> QLabel:
+        l = QLabel(text)
+        l.setWordWrap(True)
+        l.setObjectName(theme.OBJ_MUTED_LABEL)
+        return l
+
+    def _show_log(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("What was searched")
+        box.setText(f"Sources checked for {self.game.title or self.game.serial}:")
+        box.setDetailedText("\n".join(self.o["log"]))
+        box.exec()
+
+    def apply_recommended(self):
+        rec = self.o["recommendation"]
+        if hasattr(self, "patch_tree"):
+            for i in range(self.patch_tree.topLevelItemCount()):
+                top = self.patch_tree.topLevelItem(i)
+                for j in range(top.childCount()):
+                    it = top.child(j)
+                    fi, name = it.data(0, Qt.UserRole)
+                    on = name in rec.patches.get(fi, []) or (name == "*" and fi in rec.patches)
+                    it.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+        self.texture_list.setCurrentRow(rec.texture + 1 if rec.texture >= 0 else 0)
+
+    def selection(self) -> dict:
+        patches: Dict[int, List[str]] = {}
+        if hasattr(self, "patch_tree"):
+            for i in range(self.patch_tree.topLevelItemCount()):
+                top = self.patch_tree.topLevelItem(i)
+                for j in range(top.childCount()):
+                    it = top.child(j)
+                    if it.checkState(0) == Qt.Checked:
+                        fi, name = it.data(0, Qt.UserRole)
+                        patches.setdefault(fi, []).append(name)
+        cheats = [i for i in range(self.cheats_list.count()) if self.cheats_list.item(i).checkState() == Qt.Checked]
+        remove = [k for k, attr in (("patches", "remove_patches"), ("cheats", "remove_cheats"), ("textures", "remove_textures"))
+                  if getattr(self, attr, None) is not None and getattr(self, attr).isChecked()]
+        return {"patches": patches, "cheats": cheats,
+                "cheatsOverwrite": bool(self.cheats_overwrite_cb and self.cheats_overwrite_cb.isChecked()),
+                "texture": self.texture_list.currentRow() - 1,
+                "texturesOverwrite": bool(self.textures_overwrite_cb and self.textures_overwrite_cb.isChecked()),
+                "remove": remove, "fixes": [k for k, cb in self.fix_boxes.items() if cb.isChecked()]}
+
+
+def texture_candidate_label(t: dict) -> str:
+    """Human label for a texture-pack candidate (curated, GitHub or Internet Archive)."""
+    source_ref = t.get('github_repo') or t.get('archive_org_id') or t.get('manual_url') or ''
+    label = t.get('name') or source_ref or 'Pack'
+    if t.get('paid'):
+        label += "  \u00b7  paid: opens the creator's page"
+    elif t.get('manual_url'):
+        label += "  \u00b7  opens in your browser to download by hand"
+    elif t.get('archive_org_id'):
+        label += f"  \u00b7  Internet Archive ({source_ref})"
+    elif t.get('github_repo') and not t.get('verified', True):
+        label += f"  \u00b7  GitHub {source_ref}" + (f", {t['stars']}\u2605" if t.get('stars') else "")
+    return label
+
+
+class TaskWorker(QThread):
+    """Run one plain function off the UI thread.
+
+    `fn(progress)` gets a callable that posts a progress line; its return value
+    (or the exception text) comes back on the main thread through `done`. The
+    result signal is not called `finished`, so QThread's own end-of-thread
+    signal stays free for release_worker_when_done()."""
+
+    progressed = Signal(str)
+    done = Signal(object, str)          # (result, error message or "")
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
 
     def run(self):
-        self.progress.emit("Preparing Real-ESRGAN…")
-        exe = texture_upscale.ensure_realesrgan_binary(self.tools_dir, progress_cb=self.progress.emit)
-        if not exe:
-            self.done.emit(False, "Couldn't get Real-ESRGAN (check your internet connection).")
+        try:
+            result = self._fn(self.progressed.emit)
+        except Exception as e:  # reported to the caller, never raised in the thread
+            logger.error(f"[TaskWorker] {e}")
+            self.done.emit(None, str(e) or e.__class__.__name__)
             return
-        self.progress.emit("Upscaling textures… this can take a few minutes for a large dump.")
-        ok, msg = texture_upscale.upscale_textures(exe, self.src_dir, self.dst_dir, scale=self.scale)
-        self.done.emit(ok, msg)
+        self.done.emit(result, "")
 
 
-class SyncDialog(QDialog):
-    """Shown when "Sync This Game" is clicked: real control over what actually
-    gets installed instead of silently auto-installing everything found -- a
-    checkbox list of individual cheats, a choice of texture pack (curated
-    matches, or unverified GitHub search candidates the user must explicitly
-    pick), and a log of exactly what was searched so coverage isn't a black
-    box.
-    """
+class PatchAllWorker(QThread):
+    """Installs every available PCSX2 patch/fix for a list of games, off the UI
+    thread. Emits progress as (done, total) and one summary when finished."""
 
-    def __init__(self, game: 'GameEntry', cheat_candidates: List[dict], cheat_source_note: str,
-                 texture_candidates: List[dict], search_log: List[str],
-                 cheats_already_installed: bool, textures_already_installed: bool, parent=None):
+    progressed = Signal(int, int)
+    summary = Signal(dict)
+
+    def __init__(self, games: List[Tuple[str, Optional[str]]], patches_dir: str, cache_dir: str, parent=None,
+                 data_dir: str = ""):
         super().__init__(parent)
-        self.setWindowTitle(f"Install {game.title or game.serial}")
-        self.resize(640, 620)
+        self._games = games
+        self._patches_dir = patches_dir
+        self._cache_dir = cache_dir
+        self._data_dir = data_dir
 
-        layout = QVBoxLayout(self)
-        header = QLabel(f"<b>{game.title or game.serial}</b>  ({game.serial})")
-        layout.addWidget(header)
+    def run(self):
+        total = {"games": len(self._games), "with_patches": 0, "installed": 0, "skipped": 0, "failed": 0,
+                 "switched_on": 0, "error": None}
+        index, err = patches_online.load_index(self._cache_dir)
+        if not index:
+            total["error"] = err
+            self.summary.emit(total)
+            return
+        for i, (serial, crc) in enumerate(self._games, start=1):
+            if self.isInterruptionRequested():
+                break
+            r = patches_online.install_for_game(index, serial, crc, self._patches_dir)
+            if any(r.values()):
+                total["with_patches"] += 1
+            for k in ("installed", "skipped", "failed"):
+                total[k] += len(r[k])
+            # Switch the recommended groups on for the exact disc (needs its CRC).
+            files, exact = patches_online.find_for_game(index, serial, crc)
+            if exact and self._data_dir and crc:
+                try:
+                    names, managed = [], []
+                    for pf in files:
+                        groups = enhancements.parse_groups(patches_online.fetch_text(pf))
+                        managed += [g.name for g in groups]
+                        names += [g.name for g in groups if g.recommended]
+                    if names:
+                        gs = enhancements.game_settings_path(self._data_dir, serial, crc)
+                        enhancements.set_enabled(gs, enhancements.PATCHES_SECTION,
+                                                 list(dict.fromkeys(names + enhancements.read_list(gs, enhancements.PATCHES_SECTION))),
+                                                 [])
+                        total["switched_on"] += 1
+                except Exception as e:
+                    logger.warning(f"[patches] enabling for {serial}: {e}")
+            self.progressed.emit(i, len(self._games))
+        self.summary.emit(total)
 
-        # --- Cheats ---
-        cheats_title = "Cheats -- already installed" if cheats_already_installed else f"Cheats ({cheat_source_note})"
-        cheats_grp = QGroupBox(cheats_title)
-        cheats_lay = QVBoxLayout(cheats_grp)
 
-        self.cheats_overwrite_cb = None
-        cheats_content = QWidget()
-        cheats_content_lay = QVBoxLayout(cheats_content)
-        cheats_content_lay.setContentsMargins(0, 0, 0, 0)
-        self.cheats_list = QListWidget()
-        if not cheat_candidates:
-            cheats_content_lay.addWidget(QLabel("No cheats found for this game."))
-        else:
-            btn_row = QHBoxLayout()
-            btn_all = QPushButton("All")
-            btn_none = QPushButton("None")
-            btn_row.addWidget(btn_all)
-            btn_row.addWidget(btn_none)
-            btn_row.addStretch(1)
-            cheats_content_lay.addLayout(btn_row)
-            for c in cheat_candidates:
-                item = QListWidgetItem(c.get('name') or 'Cheat')
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked)
-                item.setData(Qt.UserRole, c)
-                if c.get('description'):
-                    item.setToolTip(c['description'])
-                self.cheats_list.addItem(item)
-            btn_all.clicked.connect(lambda: self._set_all_checked(Qt.Checked))
-            btn_none.clicked.connect(lambda: self._set_all_checked(Qt.Unchecked))
-        cheats_content_lay.addWidget(self.cheats_list)
+class _SortItem(QTableWidgetItem):
+    """Table cell that sorts on a separate, case-insensitive key (UserRole+1)
+    instead of its display text."""
 
-        if cheats_already_installed:
-            note = QLabel("A cheat file already exists for this game -- left unchanged unless you opt in below.")
-            note.setObjectName(theme.OBJ_MUTED_LABEL)
-            note.setWordWrap(True)
-            cheats_lay.addWidget(note)
-            self.cheats_overwrite_cb = QCheckBox("Reinstall anyway (replaces the existing cheat file entirely)")
-            self.cheats_overwrite_cb.toggled.connect(cheats_content.setEnabled)
-            cheats_lay.addWidget(self.cheats_overwrite_cb)
-            cheats_content.setEnabled(False)
-        cheats_lay.addWidget(cheats_content)
-        layout.addWidget(cheats_grp)
-
-        # --- Textures ---
-        tex_title = "Texture Pack -- already installed" if textures_already_installed else "Texture Pack"
-        tex_grp = QGroupBox(tex_title)
-        tex_lay = QVBoxLayout(tex_grp)
-
-        self.textures_overwrite_cb = None
-        tex_content = QWidget()
-        tex_content_lay = QVBoxLayout(tex_content)
-        tex_content_lay.setContentsMargins(0, 0, 0, 0)
-        self.texture_combo = QComboBox()
-        self.texture_combo.addItem("Don't install a texture pack", None)
-        for t in texture_candidates:
-            source_ref = t.get('github_repo') or t.get('archive_org_id') or t.get('manual_url') or ''
-            label = t.get('name') or source_ref or 'Pack'
-            if t.get('manual_url'):
-                label += "  (opens in your browser -- install manually)"
-            elif t.get('archive_org_id'):
-                label += f"  (unverified search result -- Internet Archive: {source_ref})"
-            elif not t.get('verified', True):
-                label += f"  (unverified search result, {t.get('stars', 0)}★ -- {source_ref})"
-            self.texture_combo.addItem(label, t)
-        if texture_candidates:
-            self.texture_combo.setCurrentIndex(1)
-        else:
-            tex_content_lay.addWidget(QLabel("No texture pack found."))
-        tex_content_lay.addWidget(self.texture_combo)
-
-        if textures_already_installed:
-            note = QLabel("A texture pack already exists for this game -- left unchanged unless you opt in below.")
-            note.setObjectName(theme.OBJ_MUTED_LABEL)
-            note.setWordWrap(True)
-            tex_lay.addWidget(note)
-            self.textures_overwrite_cb = QCheckBox("Reinstall anyway (deletes the existing pack, then copies the new one in)")
-            self.textures_overwrite_cb.toggled.connect(tex_content.setEnabled)
-            tex_lay.addWidget(self.textures_overwrite_cb)
-            tex_content.setEnabled(False)
-        tex_lay.addWidget(tex_content)
-        layout.addWidget(tex_grp)
-
-        # --- Search log ---
-        log_grp = QGroupBox("What was searched")
-        log_lay = QVBoxLayout(log_grp)
-        log_text = QTextEdit()
-        log_text.setReadOnly(True)
-        log_text.setMaximumHeight(110)
-        log_text.setPlainText("\n".join(search_log) if search_log else "(nothing to search -- already installed)")
-        log_lay.addWidget(log_text)
-        layout.addWidget(log_grp)
-
-        self._cheats_already_installed = cheats_already_installed
-        self._textures_already_installed = textures_already_installed
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.ok_btn = btns.button(QDialogButtonBox.Ok)
-        self.ok_btn.setText("Install Selected")
-        self.ok_btn.setObjectName(theme.OBJ_SUCCESS_BUTTON)
-        if self.cheats_overwrite_cb:
-            self.cheats_overwrite_cb.toggled.connect(self._update_ok_enabled)
-        if self.textures_overwrite_cb:
-            self.textures_overwrite_cb.toggled.connect(self._update_ok_enabled)
-        self._update_ok_enabled()
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-        effects.fade_in(self)
-
-    def _update_ok_enabled(self):
-        cheats_actionable = not self._cheats_already_installed or self.cheats_will_overwrite()
-        textures_actionable = not self._textures_already_installed or self.textures_will_overwrite()
-        self.ok_btn.setEnabled(cheats_actionable or textures_actionable)
-
-    def _set_all_checked(self, state):
-        for i in range(self.cheats_list.count()):
-            self.cheats_list.item(i).setCheckState(state)
-
-    def selected_cheats(self) -> List[dict]:
-        out = []
-        for i in range(self.cheats_list.count()):
-            item = self.cheats_list.item(i)
-            if item.checkState() == Qt.Checked:
-                out.append(item.data(Qt.UserRole))
-        return out
-
-    def selected_texture_entry(self) -> Optional[dict]:
-        return self.texture_combo.currentData()
-
-    def cheats_will_overwrite(self) -> bool:
-        return bool(self.cheats_overwrite_cb and self.cheats_overwrite_cb.isChecked())
-
-    def textures_will_overwrite(self) -> bool:
-        return bool(self.textures_overwrite_cb and self.textures_overwrite_cb.isChecked())
+    def __lt__(self, other):
+        a, b = self.data(Qt.UserRole + 1), other.data(Qt.UserRole + 1)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
 
 
 class LibraryView(QWidget):
-    """The main screen: your scanned game library on the left, and on the
-    right a cover-art detail panel with a one-click "Install" for the selected
-    game's cheats and textures. Replaces the old Cheats/Textures/Bulk Scanner
-    tabs as the primary flow.
+    """The game library and everything done with it (scan, add, install, covers),
+    shown in one of two ways:
+
+    Classic      -- a native toolbar + sortable game table (or cover grid), the
+                    way PCSX2's own front-end presents its game list.
+    Big Picture  -- web/bigpicture.html, a fullscreen controller-first shelf.
+
+    Both are views over the same `games` dict and the same selection, so the
+    install/scan/cover code below exists once.
     """
 
     LIBRARY_STORE = os.path.join(os.path.expanduser("~"), ".pcsx2_manager_library.json")
     COVER_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".pcsx2_manager_thumbs")
 
+    COL_COVER, COL_TITLE, COL_SERIAL, COL_REGION, COL_CRC, COL_PATCHES, COL_CHEATS, COL_TEXTURES, COL_FILE = range(9)
+    HEADERS = ["", "Title", "Serial", "Region", "CRC", "Patches", "Cheats", "Textures", "Disc Image"]
+    LIST_ICON = (30, 40)
+
     def __init__(self, parent: 'MainWindow'):
         super().__init__()
         self.parent = parent
+        self.ui_mode = theme.MODE_CLASSIC
+        self.view_mode = "list"
         self._shutting_down = False
         self._workers: List[QThread] = []
         self.games: Dict[str, GameEntry] = {}
+        self._selected_serial: Optional[str] = None
+        self._grid_cover_w = theme.GRID_COVER_DEFAULT
+        self._icon_cache: Dict[Tuple[str, int], QIcon] = {}
+        self._grid_icons: Dict[str, Tuple[tuple, QIcon]] = {}   # serial -> ((cheats, textures), icon)
+        self._status_cache: Dict[str, Tuple[bool, bool]] = {}   # serial -> installed flags (disk lookups)
+        self._busy = False
+        self._ui_ready = False   # actions fire before the widgets exist otherwise
+        self._cover_inflight: Optional[str] = None
+        # Cover downloads arrive one at a time; coalesce the resulting redraws.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(350)
+        self._refresh_timer.timeout.connect(self._refresh_library)
+        # Typing in the search box and dragging the zoom slider fire constantly;
+        # coalesce them so the UI never rebuilds more than it needs to.
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(lambda: self._refresh_library(bp=False))
+        self._zoom_save_timer = QTimer(self)
+        self._zoom_save_timer.setSingleShot(True)
+        self._zoom_save_timer.setInterval(400)
+        self._zoom_save_timer.timeout.connect(self.save_view_prefs)
 
+        self._create_actions()
         self._build_ui()
+        self._ui_ready = True
         self._load_library()
-        self._refresh_carousel()
+        self._restore_view_prefs()
+        self._refresh_library()
         self._prefetch_missing_covers()
+        self.parent.paths_changed.connect(lambda _p: self._refresh_library(clear_status=True))
+        # Exact CRCs from the disc images, once the window is up (reads a few MB per game).
+        QTimer.singleShot(2500, self._resolve_disc_crcs)
+
+    # ---- actions (shared by the toolbar, the menus and context menus) ----
+    def _act(self, text: str, icon: str, slot, shortcut: Optional[str] = None,
+             tip: str = "", checkable: bool = False) -> QAction:
+        a = QAction(icons.tab_icon(icon), text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        if tip:
+            a.setToolTip(tip)
+            a.setStatusTip(tip)
+        a.setCheckable(checkable)
+        if checkable:
+            a.toggled.connect(slot)
+        else:
+            a.triggered.connect(lambda _checked=False, f=slot: f())
+        return a
+
+    def _create_actions(self):
+        self.act_scan = self._act("Scan Folder…", "scan_folder", self._scan_folder, "Ctrl+O",
+                                  "Add every PS2 disc image found in a folder")
+        self.act_add = self._act("Add Game…", "add", self._add_game_manually, "Ctrl+N",
+                                 "Add a single game by its serial number")
+        self.act_install = self._act("Enhancements…", "enhance", self._sync_selected, "Ctrl+E",
+                                     "Patches & fixes, cheats and texture packs for the selected game")
+        self.act_patch_all = self._act("Apply Recommended Patches to All Games…", "enhance", self._patch_all_games, None,
+                                       "Install and switch on the widescreen, no-interlacing and fix patches PCSX2 "
+                                       "publishes for every game in the library")
+        self.act_cheats = self._act("Cheat Editor", "cheats", self._open_in_cheats, None,
+                                    "Open the selected game in the cheat editor")
+        self.act_textures = self._act("Texture Manager", "textures", self._open_in_textures, None,
+                                      "Open the texture pack manager")
+        self.act_launch = self._act("Launch in PCSX2", "launch", self._launch_in_pcsx2, "Ctrl+L",
+                                    "Start the selected game in PCSX2")
+        self.act_folder = self._act("Open Disc Folder", "folder", self._open_game_folder, None,
+                                    "Show the disc image in Explorer")
+        self.act_copy_serial = self._act("Copy Serial", "copy", self._copy_serial, None)
+        self.act_remove = self._act("Remove from Library", "remove", self._remove_selected, "Del",
+                                    "Remove the selected game from this list (installed files are kept)")
+        self.act_view_list = self._act("List", "view_list", lambda on: on and self._set_view_mode("list"),
+                                       "Ctrl+1", "Show games as a list", checkable=True)
+        self.act_view_grid = self._act("Grid", "view_grid", lambda on: on and self._set_view_mode("grid"),
+                                       "Ctrl+2", "Show games as cover art", checkable=True)
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        grp.addAction(self.act_view_list)
+        grp.addAction(self.act_view_grid)
+        self.act_view_list.setChecked(True)
+        self.act_zoom_in = self._act("Zoom In", "zoom_in", lambda: self._bump_zoom(16), "Ctrl+=")
+        self.act_zoom_out = self._act("Zoom Out", "zoom_out", lambda: self._bump_zoom(-16), "Ctrl+-")
+        self.act_find = self._act("Find…", "scan", lambda: self.search_box.setFocus(), "Ctrl+F")
+        self.act_big_picture = self._act("Big Picture", "big_picture", self.parent.toggle_ui_mode, "F11",
+                                         "Fullscreen, controller-friendly interface")
+        self.act_settings = self._act("Settings…", "settings", self.parent.open_settings_dialog, "Ctrl+,",
+                                      "PCSX2 folders and options")
+        self._selection_actions = (self.act_install, self.act_cheats, self.act_textures,
+                                   self.act_folder, self.act_copy_serial, self.act_remove)
 
     # ---- UI ----
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG, theme.SPACING_LG)
-        root.setSpacing(theme.SPACING_MD)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.view_stack = QStackedWidget(self)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(theme.SPACING_SM)
-        self.btn_scan = QPushButton("Scan Folder…")
-        self.btn_scan.clicked.connect(self._scan_folder)
-        effects.add_hover_glow(self.btn_scan)
-        self.btn_add = QPushButton("Add Game…")
-        self.btn_add.clicked.connect(self._add_game_manually)
-        effects.add_hover_glow(self.btn_add)
-        toolbar.addWidget(self.btn_scan)
-        toolbar.addWidget(self.btn_add)
+        # ---------- Classic ----------
+        self.classic = QWidget()
+        cl = QVBoxLayout(self.classic)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        self.toolbar = QToolBar()
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setIconSize(QSize(24, 24))
+        self.toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        for a in (self.act_scan, self.act_add):
+            self.toolbar.addAction(a)
+        self.toolbar.addSeparator()
+        for a in (self.act_install, self.act_cheats, self.act_textures, self.act_launch):
+            self.toolbar.addAction(a)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.toolbar.addWidget(spacer)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search your library…")
-        self.search_box.setMaximumWidth(220)
-        self.search_box.textChanged.connect(lambda _t: self._refresh_carousel())
-        toolbar.addWidget(self.search_box)
+        self.search_box.setPlaceholderText("Search games…")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setFixedWidth(200)
+        self.search_box.textChanged.connect(lambda _t: self._search_timer.start())
+        self.toolbar.addWidget(self.search_box)
 
-        sort_label = QLabel("Sort:")
-        sort_label.setObjectName(theme.OBJ_MUTED_LABEL)
-        toolbar.addWidget(sort_label)
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["Name (A-Z)", "Name (Z-A)", "Region"])
-        self.sort_combo.currentIndexChanged.connect(lambda _i: self._refresh_carousel())
-        toolbar.addWidget(self.sort_combo)
+        self.toolbar.addAction(self.act_view_list)
+        self.toolbar.addAction(self.act_view_grid)
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(theme.GRID_COVER_MIN, theme.GRID_COVER_MAX)
+        self.zoom_slider.setValue(self._grid_cover_w)
+        self.zoom_slider.setFixedWidth(90)
+        self.zoom_slider.setToolTip("Cover size")
+        self.zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        self.zoom_action = self.toolbar.addWidget(self.zoom_slider)
+        self.zoom_action.setVisible(False)
+        self.toolbar.addSeparator()
+        self.toolbar.addAction(self.act_settings)
+        self.toolbar.addAction(self.act_big_picture)
+        cl.addWidget(self.toolbar)
 
-        toolbar.addStretch(1)
-        self.library_count_label = QLabel("")
-        self.library_count_label.setObjectName(theme.OBJ_MUTED_LABEL)
-        toolbar.addWidget(self.library_count_label)
-        root.addLayout(toolbar)
+        self.list_stack = QStackedWidget()
+        self.table = self._build_table()
+        self.grid = self._build_grid()
+        self.empty_page = self._build_empty_page()
+        for w in (self.table, self.grid, self.empty_page):
+            self.list_stack.addWidget(w)
+        cl.addWidget(self.list_stack, 1)
 
-        self.scan_progress = QProgressBar()
-        self.scan_progress.setVisible(False)
-        root.addWidget(self.scan_progress)
+        # ---------- Big Picture ----------
+        self.bp = bigpicture.BigPictureView()
+        self.bp.selectionChanged.connect(self._on_bp_selection)
+        self.bp.actionRequested.connect(self._on_bp_action)
+        self.bp.set_methods(self.bp_rpc_methods(), self.bp_rpc_async_methods())
 
-        # The PS2-style 3D "Browser screen" -- a real Three.js/WebGL scene
-        # (see ps2_ui.py/web/carousel.html), not a QListWidget. All the actual
-        # install/scan/cover-cache logic below is unchanged from before; only
-        # this presentation layer is new.
-        self.carousel = ps2_ui.GameCarouselWidget()
-        self.carousel.setContextMenuPolicy(Qt.NoContextMenu)  # no browser-style right-click menu
-        self.carousel.selectionChanged.connect(self._on_carousel_selection_changed)
-        self.carousel.activated.connect(lambda _serial: self._sync_selected())
-        self.carousel.removeRequested.connect(self._on_remove_requested)
-        self.carousel.backRequested.connect(self.parent.show_ring_menu)
-        root.addWidget(self.carousel, 1)
+        self.view_stack.addWidget(self.classic)
+        self.view_stack.addWidget(self.bp)
+        root.addWidget(self.view_stack)
 
-        status_row = QHBoxLayout()
-        status_row.setSpacing(theme.SPACING_LG)
-        status_row.addStretch(1)
-        cheats_row = QHBoxLayout()
-        cheats_label = QLabel("Cheats:")
-        cheats_label.setObjectName(theme.OBJ_MUTED_LABEL)
-        cheats_row.addWidget(cheats_label)
-        self.cheats_status_label = QLabel("—")
-        cheats_row.addWidget(self.cheats_status_label)
-        status_row.addLayout(cheats_row)
-        textures_row = QHBoxLayout()
-        textures_label = QLabel("Textures:")
-        textures_label.setObjectName(theme.OBJ_MUTED_LABEL)
-        textures_row.addWidget(textures_label)
-        self.textures_status_label = QLabel("—")
-        textures_row.addWidget(self.textures_status_label)
-        status_row.addLayout(textures_row)
-        status_row.addStretch(1)
-        root.addLayout(status_row)
+    def _build_table(self) -> QTableWidget:
+        t = QTableWidget(0, len(self.HEADERS))
+        t.setHorizontalHeaderLabels(self.HEADERS)
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(self.LIST_ICON[1] + 6)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SingleSelection)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setShowGrid(False)
+        t.setAlternatingRowColors(True)
+        t.setIconSize(QSize(*self.LIST_ICON))
+        t.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        t.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        t.setFrameShape(QFrame.NoFrame)
+        t.setWordWrap(False)
+        hh = t.horizontalHeader()
+        hh.setHighlightSections(False)
+        hh.setSortIndicatorShown(True)
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_TITLE, QHeaderView.Stretch)
+        hh.setSectionResizeMode(self.COL_FILE, QHeaderView.Interactive)
+        t.setColumnWidth(self.COL_FILE, 220)
+        t.setSortingEnabled(True)
+        hh.setSortIndicator(self.COL_TITLE, Qt.AscendingOrder)
+        t.itemSelectionChanged.connect(self._on_classic_selection)
+        t.itemActivated.connect(lambda _i: self._sync_selected())
+        t.setContextMenuPolicy(Qt.CustomContextMenu)
+        t.customContextMenuRequested.connect(lambda pos: self._show_context_menu(t, pos))
+        return t
 
-        self.btn_sync = QPushButton("Install")
-        self.btn_sync.setObjectName(theme.OBJ_SUCCESS_BUTTON)
-        self.btn_sync.setMinimumHeight(42)
-        self.btn_sync.setMaximumWidth(260)
-        self.btn_sync.setEnabled(False)
-        self.btn_sync.clicked.connect(self._sync_selected)
-        effects.add_hover_glow(self.btn_sync, color=theme.COLOR_SUCCESS_HOVER, max_blur=28)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_sync)
-        btn_row.addStretch(1)
-        root.addLayout(btn_row)
+    def _build_grid(self) -> QListWidget:
+        g = QListWidget()
+        g.setViewMode(QListWidget.IconMode)
+        g.setMovement(QListWidget.Static)
+        g.setResizeMode(QListWidget.Adjust)
+        g.setWordWrap(True)
+        g.setUniformItemSizes(True)
+        g.setSpacing(6)
+        g.setFrameShape(QFrame.NoFrame)
+        g.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        g.itemSelectionChanged.connect(self._on_classic_selection)
+        g.itemActivated.connect(lambda _i: self._sync_selected())
+        g.setContextMenuPolicy(Qt.CustomContextMenu)
+        g.customContextMenuRequested.connect(lambda pos: self._show_context_menu(g, pos))
+        return g
 
-        self.result_label = QLabel("")
-        self.result_label.setWordWrap(True)
-        self.result_label.setObjectName(theme.OBJ_MUTED_LABEL)
-        self.result_label.setAlignment(Qt.AlignCenter)
-        root.addWidget(self.result_label)
+    def _build_empty_page(self) -> QWidget:
+        """Shown while the library has no games -- same idea as PCSX2's empty
+        game list, with the two ways to fill it right there."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.addStretch(1)
+        title = QLabel("No games in your library yet")
+        f = title.font()
+        f.setPointSize(f.pointSize() + 4)
+        f.setBold(True)
+        title.setFont(f)
+        title.setAlignment(Qt.AlignCenter)
+        lay.addWidget(title)
+        hint = QLabel("Scan the folder where you keep your PS2 disc images, or add a game by its serial number.")
+        hint.setObjectName(theme.OBJ_MUTED_LABEL)
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b1 = QPushButton("Scan Folder…")
+        b1.clicked.connect(self._scan_folder)
+        b2 = QPushButton("Add Game…")
+        b2.clicked.connect(self._add_game_manually)
+        row.addWidget(b1)
+        row.addWidget(b2)
+        row.addStretch(1)
+        lay.addSpacing(theme.SPACING_MD)
+        lay.addLayout(row)
+        lay.addStretch(2)
+        return page
 
     # ---- persistence ----
     def _load_library(self):
@@ -6486,67 +6796,368 @@ class LibraryView(QWidget):
         except Exception as e:
             logger.warning(f"[LibraryView] Failed to save library: {e}")
 
-    # ---- carousel ----
-    def _refresh_carousel(self):
-        """Rebuild the carousel's item list from self.games (unchanged data
-        model) -- the PS2-carousel equivalent of the old _refresh_list()."""
-        ft = (self.search_box.text() or "").strip().upper()
-        self.library_count_label.setText(f"{len(self.games)} game(s) in your library" if self.games else "")
-        sort_index = self.sort_combo.currentIndex() if hasattr(self, 'sort_combo') else 0
-        if sort_index == 1:
-            key_fn = lambda s: (self.games[s].title or s).upper()
-            reverse = True
-        elif sort_index == 2:
-            key_fn = lambda s: (self.games[s].serial.split('-')[0].upper(), (self.games[s].title or s).upper())
-            reverse = False
-        else:
-            key_fn = lambda s: (self.games[s].title or s).upper()
-            reverse = False
-
-        previously_selected = self.carousel.current_serial()
-
-        items = []
-        for serial in sorted(self.games.keys(), key=key_fn, reverse=reverse):
-            g = self.games[serial]
-            if ft and ft not in (g.title or "").upper() and ft not in g.serial.upper():
-                continue
-            cover_path = cover_cache_path(g.serial, self.COVER_CACHE_DIR)
-            if not os.path.isfile(cover_path):
-                cover_path = self._placeholder_cover_path(g.serial)
-            cheats_installed, textures_installed = self._game_install_status(g)
-            items.append(ps2_ui.CarouselItem(
-                serial=g.serial,
-                title=g.title or g.serial,
-                region=region_for_serial(g.serial),
-                cover_path=cover_path,
-                cheats_installed=cheats_installed,
-                textures_installed=textures_installed,
-            ))
-        self.carousel.set_items(items)
-        if previously_selected:
-            self.carousel.select_serial(previously_selected)
-
-    def _placeholder_cover_path(self, serial: str) -> str:
-        """A cached placeholder PNG for games with no fetched cover yet -- the
-        carousel textures 3D planes from files on disk, so unlike the old
-        list/grid (which could just draw a placeholder QPixmap on the fly)
-        it needs *something* on disk to point at."""
-        placeholder_dir = os.path.join(self.COVER_CACHE_DIR, "placeholders")
+    def _restore_view_prefs(self):
+        s = app_settings()
         try:
-            os.makedirs(placeholder_dir, exist_ok=True)
-        except Exception:
+            self._grid_cover_w = max(theme.GRID_COVER_MIN, min(theme.GRID_COVER_MAX,
+                                     int(s.value('ui/grid_zoom', theme.GRID_COVER_DEFAULT))))
+        except (TypeError, ValueError):
             pass
-        path = os.path.join(placeholder_dir, f"{norm_serial_key(serial)}.png")
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(self._grid_cover_w)
+        self.zoom_slider.blockSignals(False)
+        try:
+            col = int(s.value('ui/sort_col', self.COL_TITLE))
+            order = Qt.DescendingOrder if int(s.value('ui/sort_desc', 0)) else Qt.AscendingOrder
+            self.table.horizontalHeader().setSortIndicator(col, order)
+        except (TypeError, ValueError):
+            pass
+        if s.value('ui/view_mode', 'list') == 'grid':
+            self.act_view_grid.setChecked(True)
+
+    def save_view_prefs(self):
+        s = app_settings()
+        hh = self.table.horizontalHeader()
+        s.setValue('ui/view_mode', self.view_mode)
+        s.setValue('ui/grid_zoom', self._grid_cover_w)
+        s.setValue('ui/sort_col', hh.sortIndicatorSection())
+        s.setValue('ui/sort_desc', 1 if hh.sortIndicatorOrder() == Qt.DescendingOrder else 0)
+
+    # ---- display mode / view mode ----
+    def set_ui_mode(self, mode: str):
+        self.ui_mode = mode if mode in (theme.MODE_CLASSIC, theme.MODE_BIG_PICTURE) else theme.MODE_CLASSIC
+        if self.ui_mode == theme.MODE_BIG_PICTURE:
+            self.view_stack.setCurrentWidget(self.bp)
+            if self._selected_serial:
+                self.bp.select_serial(self._selected_serial)
+            self.bp.enter()
+            self.bp.setFocus()
+        else:
+            self.view_stack.setCurrentWidget(self.classic)
+            self._select_in_classic(self._selected_serial)
+            self._active_view().setFocus()
+
+    def _active_view(self) -> QWidget:
+        if not self.games:
+            return self.empty_page
+        return self.grid if self.view_mode == "grid" else self.table
+
+    def _set_view_mode(self, mode: str):
+        self.view_mode = mode
+        if not self._ui_ready:
+            return
+        self.zoom_action.setVisible(mode == "grid")
+        self.act_zoom_in.setEnabled(mode == "grid")
+        self.act_zoom_out.setEnabled(mode == "grid")
+        self._show_list_page()
+        self._select_in_classic(self._selected_serial)
+        self.save_view_prefs()
+
+    def _show_list_page(self):
+        self.list_stack.setCurrentWidget(self._active_view())
+
+    def _bump_zoom(self, delta: int):
+        self.zoom_slider.setValue(self.zoom_slider.value() + delta)
+
+    def _on_zoom_changed(self, value: int):
+        """Resizing the cover grid only changes the view's icon/grid size: the covers
+        are kept at a fixed high resolution and scaled by Qt as they're drawn, so
+        dragging the slider never rebuilds anything."""
+        self._grid_cover_w = value
+        self._apply_grid_size()
+        self._zoom_save_timer.start()
+
+    def _apply_grid_size(self):
+        cw = self._grid_cover_w
+        ch = int(cw * 4 / 3)
+        self.grid.setIconSize(QSize(cw, ch))
+        self.grid.setGridSize(QSize(cw + 24, ch + 52))
+
+    # ---- building the library views ----
+    def _cover_pixmap(self, game: GameEntry, w: int, h: int) -> QPixmap:
+        path = cover_cache_path(game.serial, self.COVER_CACHE_DIR)
         if not os.path.isfile(path):
-            try:
-                create_library_cover_placeholder(serial).save(path)
-            except Exception:
-                return ""
-        return path
+            return scale_and_crop_pixmap(create_library_cover_placeholder(game.serial), w, h)
+        # Decoding a full 512x736 cover just to draw a 40 px list icon is most of
+        # the library's build time, so each size is cached on disk next to the
+        # cover the first time it's needed (and rebuilt if the cover changes).
+        folder, name = os.path.split(path)
+        small = os.path.join(folder, "sized", f"{os.path.splitext(name)[0]}.{w}x{h}.png")
+        try:
+            if os.path.isfile(small) and os.path.getmtime(small) >= os.path.getmtime(path):
+                pm = QPixmap(small)
+                if not pm.isNull():
+                    return pm
+        except OSError:
+            pass
+        pm = QPixmap(path)
+        if pm.isNull():
+            return scale_and_crop_pixmap(create_library_cover_placeholder(game.serial), w, h)
+        pm = scale_and_crop_pixmap(pm, w, h)
+        try:
+            os.makedirs(os.path.dirname(small), exist_ok=True)
+            pm.save(small, "PNG")
+        except OSError:
+            pass
+        return pm
+
+    def _list_icon(self, game: GameEntry) -> QIcon:
+        key = (game.serial, self.LIST_ICON[0])
+        icon = self._icon_cache.get(key)
+        if icon is None:
+            icon = QIcon(self._cover_pixmap(game, *self.LIST_ICON))
+            self._icon_cache[key] = icon
+        return icon
+
+    def _matches_filter(self, g: GameEntry, needle: str) -> bool:
+        if not needle:
+            return True
+        hay = f"{g.title} {g.serial} {region_for_serial(g.serial)} {g.crc or ''}".upper()
+        return needle in hay
+
+    def _can_launch(self, game: GameEntry) -> bool:
+        exe = self.parent.settings_tab.pcsx2_exe.text().strip()
+        return bool(exe and os.path.isfile(exe) and game.source_path and os.path.isfile(game.source_path))
+
+    GRID_SRC = (240, 320)   # grid covers are stored at this size and scaled down by Qt
+
+    def _status_for(self, g: GameEntry) -> Tuple[bool, bool]:
+        s = self._status_cache.get(g.serial)
+        if s is None:
+            s = self._status_cache[g.serial] = self._game_install_status(g)
+        return s
+
+    def _grid_icon(self, g: GameEntry, cheats: bool, textures: bool) -> QIcon:
+        key = (cheats, textures)
+        hit = self._grid_icons.get(g.serial)
+        if hit and hit[0] == key:
+            return hit[1]
+        pm = self._cover_pixmap(g, *self.GRID_SRC)
+        if cheats or textures:
+            pm = self._badge_cover(pm, cheats, textures)
+        icon = QIcon(pm)
+        self._grid_icons[g.serial] = (key, icon)
+        return icon
+
+    def _refresh_library(self, bp: bool = True, clear_status: bool = False):
+        """Rebuild the views. `clear_status` re-reads what's installed from disk
+        (after installs / path changes); `bp=False` skips the Big Picture push
+        (it ignores the search filter, so typing needn't touch it)."""
+        if clear_status:
+            self._status_cache.clear()
+        needle = (self.search_box.text() or "").strip().upper() if hasattr(self, 'search_box') else ""
+        ordered = sorted(self.games.values(), key=lambda g: (g.title or g.serial).upper())
+        shown = [g for g in ordered if self._matches_filter(g, needle)]
+
+        hh = self.table.horizontalHeader()
+        col, order = hh.sortIndicatorSection(), hh.sortIndicatorOrder()
+        self.table.setUpdatesEnabled(False)
+        self.grid.setUpdatesEnabled(False)
+        try:
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(0)
+            self.grid.clear()
+            self._apply_grid_size()
+            patched = self._patches_installed_index()
+            for g in shown:
+                cheats, textures = self._status_for(g)
+                self._add_table_row(g, cheats, textures, g.serial.upper() in patched)
+                it = QListWidgetItem(self._grid_icon(g, cheats, textures), g.title or g.serial)
+                it.setData(Qt.UserRole, g.serial)
+                it.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+                it.setToolTip(f"{g.title or g.serial}\n{g.serial}")
+                self.grid.addItem(it)
+            self.table.setSortingEnabled(True)
+            self.table.sortItems(col, order)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.grid.setUpdatesEnabled(True)
+
+        self._show_list_page()
+        self._select_in_classic(self._selected_serial)
+        self.parent.set_library_count(len(self.games), len(shown))
+
+        if bp:
+            favs, played, patched = self._favorites(), self._last_played(), self._patches_installed_index()
+            self.bp.set_items([
+                bigpicture.BigPictureItem(
+                    serial=g.serial, title=g.title or g.serial, region=region_for_serial(g.serial),
+                    crc=g.crc or "", cover_path=cover_cache_path(g.serial, self.COVER_CACHE_DIR),
+                    cheats_installed=self._status_for(g)[0], textures_installed=self._status_for(g)[1],
+                    patches_installed=g.serial.upper() in patched,
+                    launchable=self._can_launch(g), favorite=g.serial in favs,
+                    last_played=played.get(g.serial, 0.0),
+                ) for g in ordered
+            ])
+            if self._selected_serial:
+                self.bp.select_serial(self._selected_serial)
+        self._update_action_states()
+
+    def _add_table_row(self, g: GameEntry, cheats: bool, textures: bool, patches: bool = False):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        title = g.title or g.serial
+
+        cover = QTableWidgetItem()
+        cover.setIcon(self._list_icon(g))
+        cover.setData(Qt.UserRole + 1, "")
+        self.table.setItem(row, self.COL_COVER, cover)
+
+        def cell(col, text, key=None, color=None):
+            it = _SortItem(text)
+            it.setData(Qt.UserRole + 1, (key if key is not None else text).upper())
+            if col == self.COL_TITLE:
+                it.setData(Qt.UserRole, g.serial)
+            if color:
+                it.setForeground(QColor(color))
+            self.table.setItem(row, col, it)
+
+        cell(self.COL_TITLE, title)
+        cell(self.COL_SERIAL, g.serial)
+        cell(self.COL_REGION, region_for_serial(g.serial))
+        cell(self.COL_CRC, g.crc or "")
+        self.table.item(row, self.COL_CRC).setToolTip(
+            "Read from the disc image (exact)" if g.crc_source == 'disc' else
+            f"From {g.crc_source}; may differ from your copy" if g.crc else "Unknown -- add the disc image")
+        cell(self.COL_PATCHES, "Installed" if patches else "—", "1" if patches else "0",
+             theme.COLOR_SUCCESS if patches else None)
+        cell(self.COL_CHEATS, "Installed" if cheats else "—", "1" if cheats else "0",
+             theme.COLOR_SUCCESS if cheats else None)
+        cell(self.COL_TEXTURES, "Installed" if textures else "—", "1" if textures else "0",
+             theme.COLOR_SUCCESS if textures else None)
+        cell(self.COL_FILE, os.path.basename(g.source_path) if g.source_path else "")
+        self.table.item(row, self.COL_FILE).setToolTip(g.source_path or "")
+
+    @staticmethod
+    def _badge_cover(pm: QPixmap, cheats_installed: bool, textures_installed: bool) -> QPixmap:
+        """Small corner dot on a grid cover: green when both are installed,
+        amber when only one is."""
+        out = QPixmap(pm)
+        d = max(10, out.width() // 9)
+        color = QColor(theme.COLOR_SUCCESS) if (cheats_installed and textures_installed) else QColor(theme.COLOR_WARNING)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(color)
+        p.setPen(QColor("#1c1c1c"))
+        p.drawEllipse(out.width() - d - 5, out.height() - d - 5, d, d)
+        p.end()
+        return out
+
+    # ---- selection (single source of truth: self._selected_serial) ----
+    def _classic_serial(self) -> Optional[str]:
+        if self.view_mode == "grid":
+            it = self.grid.currentItem()
+            return it.data(Qt.UserRole) if it and it.isSelected() else None
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            it = self.table.item(rows[0].row(), self.COL_TITLE)
+            return it.data(Qt.UserRole) if it else None
+        return None
+
+    def _select_in_classic(self, serial: Optional[str]):
+        """Reflect `serial` in whichever classic view is showing, without
+        re-triggering the selection handlers."""
+        self.table.blockSignals(True)
+        self.grid.blockSignals(True)
+        try:
+            self.table.clearSelection()
+            self.grid.clearSelection()
+            if serial:
+                for r in range(self.table.rowCount()):
+                    if self.table.item(r, self.COL_TITLE).data(Qt.UserRole) == serial:
+                        self.table.selectRow(r)
+                        self.table.scrollToItem(self.table.item(r, self.COL_TITLE))
+                        break
+                for i in range(self.grid.count()):
+                    if self.grid.item(i).data(Qt.UserRole) == serial:
+                        self.grid.setCurrentRow(i)
+                        self.grid.scrollToItem(self.grid.item(i))
+                        break
+        finally:
+            self.table.blockSignals(False)
+            self.grid.blockSignals(False)
+
+    def _on_classic_selection(self):
+        self._select(self._classic_serial(), source="classic")
+
+    def _on_bp_selection(self, serial: str):
+        self._select(serial or None, source="bp")
+
+    def _select(self, serial: Optional[str], source: str):
+        self._selected_serial = serial
+        game = self.games.get(serial) if serial else None
+        self.parent.state.current_game = game
+        self.parent.current_game_changed.emit(game)
+        if source != "bp" and self.ui_mode == theme.MODE_BIG_PICTURE and serial:
+            self.bp.select_serial(serial)
+        self._update_action_states()
+        self.parent.set_status_hint(self._describe(game))
+        if game:
+            self._load_cover_if_missing(game)
+
+    @staticmethod
+    def _describe(game: Optional[GameEntry]) -> str:
+        if not game:
+            return ""
+        bits = [game.title or game.serial, game.serial, region_for_serial(game.serial)]
+        if game.crc:
+            bits.append(f"CRC {game.crc}")
+        return "  ·  ".join(b for b in bits if b)
 
     def _selected_game(self) -> Optional[GameEntry]:
-        serial = self.carousel.current_serial()
-        return self.games.get(serial) if serial else None
+        return self.games.get(self._selected_serial) if self._selected_serial else None
+
+    def _update_action_states(self):
+        game = self._selected_game()
+        for a in self._selection_actions:
+            a.setEnabled(game is not None and not self._busy)
+        self.act_folder.setEnabled(bool(game and game.source_path and os.path.exists(game.source_path)))
+        self.act_launch.setEnabled(bool(game and self._can_launch(game)))
+        self.act_scan.setEnabled(not self._busy)
+
+    # ---- context menu ----
+    def _show_context_menu(self, view, pos):
+        if view is self.table:
+            idx = self.table.indexAt(pos)
+            if idx.isValid():
+                self.table.selectRow(idx.row())
+        else:
+            it = self.grid.itemAt(pos)
+            if it:
+                self.grid.setCurrentItem(it)
+        if not self._selected_game():
+            return
+        menu = QMenu(self)
+        menu.addAction(self.act_install)
+        menu.addSeparator()
+        for a in (self.act_cheats, self.act_textures, self.act_launch, self.act_folder):
+            menu.addAction(a)
+        menu.addSeparator()
+        menu.addAction(self.act_copy_serial)
+        menu.addAction(self.act_remove)
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    # ---- actions on the selected game ----
+    def _copy_serial(self):
+        game = self._selected_game()
+        if game:
+            QApplication.clipboard().setText(game.serial)
+            self.parent.flash_status(f"Copied {game.serial}")
+
+    def _remove_selected(self):
+        game = self._selected_game()
+        if game:
+            self._remove_game(game)
+
+    def _notify(self, text: str, title: str = "", warn: bool = False):
+        """Tell the user something. Classic uses a message box; Big Picture shows
+        an in-page toast instead, because it must never open a native window."""
+        if self.ui_mode == theme.MODE_BIG_PICTURE:
+            self.bp.show_toast(text)
+        elif warn:
+            QMessageBox.warning(self, title, text)
+        else:
+            QMessageBox.information(self, title, text)
 
     def _remove_game(self, game: GameEntry):
         reply = QMessageBox.question(
@@ -6557,103 +7168,412 @@ class LibraryView(QWidget):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            del self.games[game.serial]
-            self._save_library()
-            self._refresh_carousel()
+            self._forget_game(game.serial)
 
-    def _on_remove_requested(self, serial: str):
-        game = self.games.get(serial)
-        if game:
-            self._remove_game(game)
-
-    def _set_status(self, label: QLabel, text: str, kind: str = "muted"):
-        obj_names = {
-            "success": theme.OBJ_STATUS_SUCCESS,
-            "warning": theme.OBJ_STATUS_WARNING,
-            "error": theme.OBJ_STATUS_ERROR,
-        }
-        label.setText(text)
-        label.setObjectName(obj_names.get(kind, theme.OBJ_MUTED_LABEL))
-        label.style().unpolish(label)
-        label.style().polish(label)
-
-    def _on_carousel_selection_changed(self, serial: str):
-        game = self.games.get(serial)
-        if not game:
-            self.btn_sync.setEnabled(False)
-            self._set_status(self.cheats_status_label, "—")
-            self._set_status(self.textures_status_label, "—")
-            self.result_label.setText("")
-            self.parent.state.current_game = None
-            self.parent.current_game_changed.emit(None)
+    def _forget_game(self, serial: str):
+        """Drop a game from the library list (no confirmation; callers ask first)."""
+        if serial not in self.games:
             return
-        self._refresh_installed_status(game)
-        self.result_label.setText("")
-        self.btn_sync.setEnabled(True)
+        del self.games[serial]
+        if self._selected_serial == serial:
+            self._selected_serial = None
+            self._select(None, source="classic")
+        self._save_library()
+        self._refresh_library()
 
-        self._load_cover_if_missing(game)
+    def _open_in_cheats(self):
+        if self._selected_game():
+            self.parent.open_advanced_cheats()
 
-        self.parent.state.current_game = game
-        self.parent.current_game_changed.emit(game)
+    def _open_in_textures(self):
+        self.parent.open_advanced_textures()
+
+    def _open_game_folder(self):
+        game = self._selected_game()
+        if game and game.source_path and os.path.exists(game.source_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(os.path.abspath(game.source_path))))
+
+    def _launch_in_pcsx2(self):
+        game = self._selected_game()
+        exe = self.parent.settings_tab.pcsx2_exe.text().strip()
+        if not exe or not os.path.isfile(exe):
+            self._notify("Set the path to the PCSX2 program in Settings first.", "PCSX2 not set")
+            return
+        if not game or not game.source_path or not os.path.isfile(game.source_path):
+            self._notify("This game has no disc image on disk to launch (it was added by serial).",
+                         "Disc image not found")
+            return
+        try:
+            subprocess.Popen([exe, game.source_path], cwd=os.path.dirname(exe))
+        except Exception as e:
+            self._notify(f"Couldn't start PCSX2: {e}", "Launch failed", warn=True)
+            return
+        played = self._last_played()
+        played[game.serial] = time.time()
+        app_settings().setValue("library/last_played", json.dumps(played))
+        if self.ui_mode == theme.MODE_BIG_PICTURE:
+            self.bp.show_toast(f"Starting {game.title or game.serial}…")
+        self._refresh_timer.start()
+
+    # ---- Big Picture requests ----
+    def _on_bp_action(self, action: str, serial: str):
+        """The few actions Big Picture hands to Python. Everything that needs a
+        screen (install, settings, add, scan, confirm) lives in the page and talks
+        to us through bp_rpc_methods() instead, so no native window ever opens."""
+        if serial and serial in self.games:
+            self._selected_serial = serial
+        if action == "launch":
+            self._launch_in_pcsx2()
+        elif action == "exit":
+            self.parent.set_ui_mode(theme.MODE_CLASSIC)
+
+    # ---- Big Picture RPC (called from web/bigpicture.html) ----
+    def bp_rpc_async_methods(self) -> Dict[str, Any]:
+        """Requests that take a while: fn(arg, reply) answers later via reply(dict)
+        and may post progress lines with reply.progress(text)."""
+        return {
+            "install.prepare": self._rpc_install_prepare,
+            "install.apply": self._rpc_install_apply,
+        }
+
+    def bp_rpc_methods(self) -> Dict[str, Any]:
+        return {
+            "settings.get": lambda a: self._rpc_settings(),
+            "settings.set_option": self._rpc_set_option,
+            "settings.set_path": self._rpc_set_path,
+            "settings.detect": lambda a: self._rpc_detect(),
+            "fs.list": self._rpc_fs_list,
+            "texture.remember": self._rpc_remember_source,
+            "game.add": self._rpc_add_game,
+            "game.remove": self._rpc_remove_game,
+            "library.scan": self._rpc_scan,
+            "library.patch_all": lambda a: ({"error": e} if (e := self._patch_all_games(confirm=False)) else {"ok": True}),
+            "prefs.get": lambda a: self._rpc_prefs(),
+            "prefs.set": self._rpc_set_pref,
+            "game.favorite": self._rpc_favorite,
+            "app.info": lambda a: {"name": APP_NAME, "version": APP_VERSION,
+                                   "games": len(self.games), "pcsx2": bool(self.parent.settings_tab.pcsx2_exe.text().strip())},
+        }
+
+    # Big Picture's own preferences. Kept in the app settings (not the page's
+    # localStorage, which QtWebEngine's default profile forgets on exit).
+    BP_PREFS = {"sounds": True, "volume": 0.5, "motion": "full", "mode": "shelf",
+                "zoom": 1.0, "filter": "all", "clock": True}
+
+    def _rpc_prefs(self) -> dict:
+        s = app_settings()
+        out = {}
+        for key, default in self.BP_PREFS.items():
+            v = s.value(f"bp/{key}", default)
+            try:
+                if isinstance(default, bool):
+                    v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
+                elif isinstance(default, float):
+                    v = float(v)
+                else:
+                    v = str(v)
+            except (TypeError, ValueError):
+                v = default
+            out[key] = v
+        return out
+
+    def _rpc_set_pref(self, a: dict) -> dict:
+        key = a.get("key")
+        if key not in self.BP_PREFS:
+            return {"error": f"unknown preference {key!r}"}
+        app_settings().setValue(f"bp/{key}", a.get("value"))
+        return self._rpc_prefs()
+
+    def _favorites(self) -> set:
+        v = app_settings().value("library/favorites", [])
+        if isinstance(v, str):
+            v = [v] if v else []
+        return set(v or [])
+
+    def _last_played(self) -> Dict[str, float]:
+        try:
+            return {k: float(t) for k, t in json.loads(app_settings().value("library/last_played", "{}", str) or "{}").items()}
+        except (ValueError, TypeError, AttributeError):
+            return {}
+
+    def _rpc_favorite(self, a: dict) -> dict:
+        serial = a.get("serial", "")
+        if serial not in self.games:
+            return {"error": "That game isn't in the library."}
+        favs = self._favorites()
+        on = bool(a.get("on", serial not in favs))
+        (favs.add if on else favs.discard)(serial)
+        app_settings().setValue("library/favorites", sorted(favs))
+        return {"serial": serial, "favorite": on}
+
+    def _patches_installed_index(self) -> set:
+        """Serials that have a PCSX2 patch file installed (<SERIAL>_<CRC>.pnach)."""
+        d = (self.parent.state.pcsx2_paths or {}).get('patches', '')
+        try:
+            return {n.split('_', 1)[0].upper() for n in os.listdir(d) if n.lower().endswith('.pnach')} if d else set()
+        except OSError:
+            return set()
+
+    def _rpc_settings(self) -> dict:
+        t = self.parent.settings_tab
+        text, kind = t.folder_status()
+        have = os.path.isfile(t._ini_path())
+        ini = t._ini_path()
+        return {
+            "userDir": t.user_dir.text().strip(), "exe": t.pcsx2_exe.text().strip(),
+            "status": {"text": text, "kind": kind},
+            "options": [{"section": s, "key": k, "label": label, "tip": tip, "enabled": have,
+                         "on": bool(have and ini_get_bool(ini, k, s))} for label, tip, s, k in PCSX2_OPTIONS],
+            "note": ("Close PCSX2 before changing these -- it rewrites its settings file when it exits." if have
+                     else "Available once PCSX2.ini exists (start PCSX2 once)."),
+        }
+
+    def _rpc_set_option(self, a: dict) -> dict:
+        t = self.parent.settings_tab
+        ok = ini_set_bool(t._ini_path(), a["key"], bool(a["on"]), a["section"])
+        out = self._rpc_settings()
+        if not ok:
+            out["error"] = "Couldn't write PCSX2.ini. Is the data folder correct?"
+        return out
+
+    def _rpc_set_path(self, a: dict) -> dict:
+        t = self.parent.settings_tab
+        path = (a.get("path") or "").strip()
+        if a.get("kind") == "exe":
+            t.pcsx2_exe.setText(path)
+            t._save_pcsx2_exe()
+            out = self._rpc_settings()
+            exe_dir = os.path.dirname(os.path.abspath(path)) if path else ""
+            if exe_dir and os.path.isfile(os.path.join(exe_dir, "portable.ini")) \
+                    and os.path.normcase(os.path.abspath(t.user_dir.text().strip() or ".")) != os.path.normcase(exe_dir):
+                out["portableSuggestion"] = exe_dir
+        else:
+            t.user_dir.setText(path)
+            t._update_subs()
+            out = self._rpc_settings()
+        self._refresh_library(clear_status=True)
+        return out
+
+    def _rpc_detect(self) -> dict:
+        t = self.parent.settings_tab
+        guesses = default_pcsx2_user_dirs(t.pcsx2_exe.text().strip())
+        if not guesses:
+            out = self._rpc_settings()
+            out["error"] = "Couldn't find PCSX2's data folder. Start PCSX2 once, or choose the folder yourself."
+            return out
+        return self._rpc_set_path({"kind": "userDir", "path": guesses[0]})
+
+    @staticmethod
+    def _rpc_fs_list(a: dict) -> dict:
+        """List a folder for the in-page file browser. Empty path = the drives/home."""
+        path = (a.get("path") or "").strip()
+        exts = tuple(e.lower() for e in (a.get("exts") or []))
+        if not path:
+            roots = []
+            if IS_WINDOWS:
+                import string
+                roots = [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
+            roots.append(os.path.expanduser("~"))
+            return {"path": "", "parent": None, "dirs": [{"name": r, "path": r} for r in roots], "files": []}
+        p = os.path.abspath(path)
+        if not os.path.isdir(p):
+            p = os.path.dirname(p) if os.path.isdir(os.path.dirname(p)) else os.path.expanduser("~")
+        dirs, files = [], []
+        try:
+            for e in os.scandir(p):
+                if e.name.startswith(('.', '$')):
+                    continue
+                try:
+                    if e.is_dir():
+                        dirs.append({"name": e.name, "path": e.path})
+                    elif exts and e.name.lower().endswith(exts):
+                        files.append({"name": e.name, "path": e.path})
+                except OSError:
+                    continue
+        except OSError as err:
+            return {"path": p, "parent": os.path.dirname(p), "dirs": [], "files": [], "error": str(err)}
+        key = lambda x: x["name"].lower()
+        parent = os.path.dirname(p)
+        return {"path": p, "parent": "" if parent == p else parent,
+                "dirs": sorted(dirs, key=key)[:500], "files": sorted(files, key=key)[:500]}
+
+    def _rpc_install_prepare(self, a: dict, reply) -> None:
+        game = self.games.get(a.get("serial", ""))
+        if not game:
+            reply({"error": "That game isn't in the library."})
+            return
+        self._selected_serial = game.serial
+
+        def _found(opts, err):
+            if err:
+                reply({"error": err})
+                return
+            self._bp_install_ctx = (game, opts)
+            reply(self._enhancements_json(game, opts))
+        self._gather_async(game, _found)
+
+    @staticmethod
+    def _enhancements_json(game: GameEntry, o: dict) -> dict:
+        rec = o["recommendation"]
+        return {
+            "serial": game.serial, "title": game.title or game.serial, "crc": game.crc or "",
+            "crcSource": game.crc_source or "",
+            "recommended": {"summary": rec.summary, "patches": {str(k): v for k, v in rec.patches.items()},
+                            "texture": rec.texture},
+            "patches": [{"label": f"{p['file'].serial} · CRC {p['file'].crc}" + ("  (your disc)" if p["exact"] else ""),
+                         "exact": p["exact"], "installed": p["installed"], "update": p.get("update", False), "always": p["always"],
+                         "groups": [dict(g.to_json(), enabled=g.enabled, kindLabel=enhancements.KIND_LABEL[g.kind])
+                                    for g in p["groups"]]} for p in o["patches"]],
+            "cheats": [{"name": c.get("name") or "Cheat", "description": c.get("description", ""),
+                        "source": c.get("source", ""), "enabled": c.get("enabled", False)} for c in o["cheats"]],
+            "cheatNote": o["cheat_note"], "cheatsInstalled": o["cheats_installed"], "cheatsForeign": o["cheats_foreign"],
+            "textures": [{"label": texture_candidate_label(t), "confidence": t.get("confidence", ""),
+                          "confidenceLabel": enhancements.CONFIDENCE_LABEL.get(t.get("confidence"), ""),
+                          "score": t.get("score", 0)} for t in o["textures"]],
+            "texturesInstalled": o["textures_installed"],
+            "checks": [c.to_json() for c in o["checks"]],
+            "log": o["log"],
+        }
+
+    def _rpc_install_apply(self, a: dict, reply) -> None:
+        ctx = getattr(self, "_bp_install_ctx", None)
+        if not ctx:
+            reply({"error": "Nothing to apply."})
+            return
+        self._bp_install_ctx = None
+        game, o = ctx
+
+        def _done(results, followups):
+            offers = self._run_followups(followups, ask=False)
+            self._bp_offers = offers
+            reply({"results": results,
+                   "remember": [{"i": i, "label": entry.get('github_repo') or entry.get('archive_org_id') or "this source"}
+                                for i, (_s, entry, _u) in enumerate(offers)]})
+        self._apply_async(game, o, a, on_done=_done, on_progress=reply.progress)
+
+    def _rpc_remember_source(self, a: dict) -> dict:
+        offers = getattr(self, "_bp_offers", []) or []
+        i = a.get("i", -1)
+        if not isinstance(i, int) or not 0 <= i < len(offers):
+            return {"error": "Nothing to remember."}
+        serial, entry, url = offers[i]
+        from urllib.parse import unquote
+        clean = {'name': entry.get('name') or entry.get('github_repo') or entry.get('archive_org_id'),
+                 'asset_pattern': unquote(os.path.basename(url.split('?')[0]))}
+        if entry.get('archive_org_id'):
+            clean['archive_org_id'] = entry['archive_org_id']
+        else:
+            clean['github_repo'] = entry.get('github_repo')
+        return {"ok": True} if save_texture_source(serial, clean) else {"error": "Couldn't update texture_sources.json."}
+
+    def _rpc_add_game(self, a: dict) -> dict:
+        err = self._add_game(a.get("serial", ""), a.get("title", ""))
+        return {"error": err} if err else {"ok": True}
+
+    def _rpc_remove_game(self, a: dict) -> dict:
+        self._forget_game(a.get("serial", ""))
+        return {"ok": True}
+
+    def _rpc_scan(self, a: dict) -> dict:
+        folder = (a.get("path") or "").strip()
+        if not os.path.isdir(folder):
+            return {"error": "That folder doesn't exist."}
+        self._scan_folder(folder)
+        return {"ok": True}
 
     # ---- cover art ----
     def _load_cover_if_missing(self, game: GameEntry):
-        """The bulk CoverPrefetchWorker (see _prefetch_missing_covers) already
-        covers most games; this is the fallback for one that slipped through
-        (e.g. added manually after the last prefetch pass). Updates the
-        carousel's texture in place once fetched -- there's no separate
-        "hero" cover widget anymore, the carousel tile *is* the display."""
+        """The bulk CoverPrefetchWorker (see _prefetch_missing_covers) covers
+        most games; this is the fallback for one that slipped through (e.g.
+        added manually after the last prefetch pass)."""
         cache_path = cover_cache_path(game.serial, self.COVER_CACHE_DIR)
-        if os.path.isfile(cache_path):
+        if os.path.isfile(cache_path) or self._cover_inflight == game.serial:
             return
-
         candidates = build_cover_candidates(game.serial)
         if not candidates:
             return
-
         try:
             os.makedirs(self.COVER_CACHE_DIR, exist_ok=True)
         except Exception:
             pass
+        self._cover_inflight = game.serial
         worker = CoverFetchWorker(candidates, cache_path, parent=self)
-
-        def _on_fetched(path):
-            self.carousel.update_cover(game.serial, path)
-
-        def _on_failed():
-            pass  # keep showing the placeholder texture already in place
-
-        worker.fetched.connect(_on_fetched)
-        worker.fetch_failed.connect(_on_failed)
+        worker.fetched.connect(lambda path, s=game.serial: self._on_cover_ready(s, path))
+        worker.fetch_failed.connect(self._clear_cover_inflight)
         self._start_worker(worker)
 
+    def _clear_cover_inflight(self):
+        self._cover_inflight = None
+
+    def _on_cover_ready(self, serial: str, path: str):
+        if self._cover_inflight == serial:
+            self._cover_inflight = None
+        self._icon_cache.pop((serial, self.LIST_ICON[0]), None)
+        self._grid_icons.pop(serial, None)
+        self.bp.update_cover(serial, path)
+        self._refresh_timer.start()
+
     # ---- scanning ----
-    def _scan_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select your games folder", os.path.expanduser("~"))
+    def _resolve_disc_crcs(self):
+        """Read the exact CRC from the disc image of every game that has one but
+        whose CRC came from a database (or is missing). Databases are often wrong
+        or for another revision, and PCSX2 only loads files named after the real
+        CRC -- so this is what makes cheats and patches line up for certain."""
+        todo = [(g.serial, g.source_path) for g in self.games.values()
+                if g.source_path and g.crc_source != 'disc' and not g.source_path.lower().endswith('.chd')
+                and os.path.isfile(g.source_path)]
+        if not todo or self._busy:
+            return
+
+        def _work(_progress):
+            return [(serial, disc.read_disc_info(path)) for serial, path in todo]
+
+        def _done(results, _err):
+            changed = 0
+            for serial, info in results or []:
+                g = self.games.get(serial)
+                if g and info and info.crc:
+                    if g.crc != info.crc:
+                        changed += 1
+                    g.crc, g.crc_source = info.crc, 'disc'
+            self._save_library()
+            if changed:
+                self._refresh_library(clear_status=True)
+                self.parent.flash_status(f"Read the exact CRC from {changed} disc image(s).")
+        self._run_task(_work, _done, busy=False)
+
+    def _scan_folder(self, folder: Optional[str] = None):
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "Select your games folder", os.path.expanduser("~"))
         if not folder:
             return
-        self.scan_progress.setVisible(True)
-        self.scan_progress.setRange(0, 0)
-        self.btn_scan.setEnabled(False)
+        self._set_busy(True)
+        self.parent.show_progress(0, 0, "Scanning…")
         worker = GameScanWorker(folder, parent=self)
         worker.progressed.connect(self._on_scan_progress)
         worker.finished.connect(self._on_scan_finished)
         self._start_worker(worker)
 
     def _on_scan_progress(self, current, total):
-        self.scan_progress.setRange(0, total)
-        self.scan_progress.setValue(current)
+        self.parent.show_progress(current, total, "Scanning…")
 
     def _on_scan_finished(self, entries, total_files):
-        self.scan_progress.setVisible(False)
-        self.btn_scan.setEnabled(True)
+        self.parent.hide_progress()
+        self._set_busy(False)
         added = 0
         for g in entries:
-            if g.serial not in self.games:
+            old = self.games.get(g.serial)
+            if old is None:
                 self.games[g.serial] = g
                 added += 1
+            else:
+                # Already known: keep the user's title, but take the disc's path and exact CRC.
+                old.source_path = old.source_path or g.source_path
+                if g.crc_source == 'disc':
+                    old.crc, old.crc_source = g.crc, 'disc'
+        self._status_cache.clear()
         self._save_library()
-        self._refresh_carousel()
+        self._refresh_library()
 
         if total_files == 0:
             msg = "No disc images (.iso/.bin/.chd/.cso) were found in that folder."
@@ -6663,7 +7583,7 @@ class LibraryView(QWidget):
                    f"didn't work for .bin/.chd/.cso -- only plain .iso is supported for that).")
         else:
             msg = f"Found {total_files} disc image(s) in that folder, added {added} new to your library."
-        QMessageBox.information(self, "Scan Complete", msg)
+        self._notify(msg, "Scan Complete")
         self._prefetch_missing_covers()
 
     # ---- bulk cover prefetch (matches PCSX2's own "fetch all covers" behavior) ----
@@ -6682,8 +7602,19 @@ class LibraryView(QWidget):
         self._start_worker(worker)
 
     def _on_cover_prefetched(self, serial: str):
-        cache_path = cover_cache_path(serial, self.COVER_CACHE_DIR)
-        self.carousel.update_cover(serial, cache_path)
+        self._on_cover_ready(serial, cover_cache_path(serial, self.COVER_CACHE_DIR))
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        self._update_action_states()
+
+    def refresh(self):
+        """Rebuild both views from the current library and PCSX2 paths."""
+        self._refresh_library(clear_status=True)
+
+    def focus_active(self):
+        target = self.bp if self.ui_mode == theme.MODE_BIG_PICTURE else self._active_view()
+        target.setFocus()
 
     # ---- manual add ----
     def _add_game_manually(self):
@@ -6700,223 +7631,626 @@ class LibraryView(QWidget):
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         lay.addRow(btns)
-        effects.fade_in(dlg)
         if dlg.exec() != QDialog.Accepted:
             return
+        err = self._add_game(serial_edit.text(), title_edit.text())
+        if err:
+            QMessageBox.warning(self, "Invalid Serial", err)
 
-        m = SERIAL_RE.search(serial_edit.text().strip())
+    def _add_game(self, serial_text: str, title_text: str = "") -> Optional[str]:
+        """Add a game by serial. Returns an error message, or None on success."""
+        m = SERIAL_RE.search((serial_text or "").strip())
         if not m:
-            QMessageBox.warning(self, "Invalid Serial", "Enter a valid PS2 serial, e.g. SLUS-20946.")
-            return
+            return "Enter a valid PS2 serial, e.g. SLUS-20946."
         serial = m.group(0).upper().replace('_', '-').replace(' ', '-')
-        title = title_edit.text().strip() or bundled_lookup_title(serial) or serial
+        title = (title_text or "").strip() or bundled_lookup_title(serial) or serial
         self.games[serial] = GameEntry(serial=serial, title=title, crc=None, source_path=None)
+        self._selected_serial = serial
         self._save_library()
-        self._refresh_carousel()
+        self._refresh_library()
+        return None
 
     # ---- sync ----
+    def _resolve_crc(self, game: GameEntry, log: list, index=None):
+        """Best CRC for `game`, most reliable source first: the disc image, then
+        PCSX2's own patch list (when it knows exactly one CRC for the serial),
+        then the cheat database, then an online lookup."""
+        if game.source_path and game.crc_source != 'disc' and os.path.isfile(game.source_path) \
+                and not game.source_path.lower().endswith('.chd'):
+            info = disc.read_disc_info(game.source_path)
+            if info and info.crc:
+                if game.crc and game.crc != info.crc:
+                    log.append(f"CRC: corrected {game.crc} -> {info.crc} (read from your disc image).")
+                game.crc, game.crc_source = info.crc, 'disc'
+        if game.crc_source == 'disc' and game.crc:
+            log.append(f"CRC: {game.crc}, read from your disc image.")
+            return
+        if not game.crc and index:
+            crcs = sorted({pf.crc for pf in index if pf.serial == patches_online.normalize_serial(game.serial)})
+            if len(crcs) == 1:
+                game.crc, game.crc_source = crcs[0], "PCSX2's patch list"
+                log.append(f"CRC: {game.crc}, the only revision in PCSX2's patch list.")
+                return
+        if not game.crc:
+            local = find_local_cheats(game.serial)
+            if local and local[1]:
+                game.crc, game.crc_source = local[1].upper(), 'cheat database'
+                log.append(f"CRC: {game.crc}, from the cheat database.")
+                return
+        if not game.crc:
+            try:
+                _t, resolved, _h = cheat_online.resolve_serial_online([game.serial, norm_serial_key(game.serial)])
+                if resolved:
+                    game.crc, game.crc_source = resolved.upper(), 'online lookup'
+                    log.append(f"CRC: {game.crc}, from an online lookup.")
+                    return
+            except Exception as e:
+                log.append(f"CRC: online lookup failed ({e}).")
+        if game.crc:
+            log.append(f"CRC: {game.crc} ({game.crc_source or 'saved earlier'}).")
+        else:
+            log.append("CRC: unknown. Add the game's disc image so PCTX can read it.")
+
+    @staticmethod
+    def _cheat_key(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
     def _gather_cheat_candidates(self, game: GameEntry, cheats_dir: str):
-        """Look up (without installing) what cheats are available, from the
-        local database first and online sources as a fallback. Returns
+        """Every cheat available for the game, from every source, merged and
+        de-duplicated (the local database, the CRC-keyed GitHub collection, and
+        GameHacking.org / PSXDataCenter). Returns
         (candidates, source_note, log_lines, already_installed)."""
-        log = []
+        log, out, seen, sources = [], [], set(), []
+
+        def add(items, source):
+            n = 0
+            for c in items:
+                key = self._cheat_key(c.get('name'))
+                if not c.get('codes') or not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(dict(c, source=source))
+                n += 1
+            if n:
+                sources.append(source)
+            return n
+
         local = find_local_cheats(game.serial)
         if local:
             title, crc, cheats = local
-            if crc:
-                game.crc = crc
-            log.append(f"Local database: found \"{title}\" with {len(cheats)} cheat(s).")
-            return cheats, "from the local database", log, self._cheats_already_installed(cheats_dir, crc)
-
-        log.append("Local database: no entry for this serial.")
-
-        # A CRC is needed both to write a .pnach at all and to look up the
-        # CRC-keyed GitHub collection below -- resolve one now if we don't
-        # already have it, rather than only discovering the gap at install time.
-        if not game.crc:
-            try:
-                _resolved_title, resolved_crc, _html = cheat_online.resolve_serial_online(
-                    [game.serial, norm_serial_key(game.serial)])
-                if resolved_crc:
-                    game.crc = resolved_crc
-                    log.append(f"Resolved CRC online: {resolved_crc}.")
-                else:
-                    log.append("Could not resolve a CRC online.")
-            except Exception as e:
-                log.append(f"CRC resolution failed: {e}")
-
-        all_codes: List[dict] = []
-        seen_names = set()
+            same = not crc or not game.crc or crc.upper() == game.crc.upper()
+            if same:
+                log.append(f"Local database: {add(cheats, 'local database')} cheat(s) for \"{title}\".")
+            else:
+                log.append(f"Local database: has cheats for CRC {crc.upper()}, but your disc is {game.crc} "
+                           "(another revision), so they were skipped.")
+        else:
+            log.append("Local database: no entry for this serial.")
 
         if game.crc:
-            gh_cheats = fetch_github_pnach_cheats(game.crc)
-            if gh_cheats:
-                log.append(f"GitHub cheat collection: found {len(gh_cheats)} cheat(s) for CRC {game.crc}.")
-                for c in gh_cheats:
-                    if c['name'] not in seen_names:
-                        seen_names.add(c['name'])
-                        all_codes.append(c)
-            else:
-                log.append("GitHub cheat collection: nothing found for this CRC.")
+            try:
+                n = add(fetch_github_pnach_cheats(game.crc), 'GitHub collection')
+                log.append(f"GitHub cheat collection: {n} cheat(s) for CRC {game.crc}." if n
+                           else "GitHub cheat collection: nothing for this CRC.")
+            except Exception as e:
+                log.append(f"GitHub cheat collection: failed ({e}).")
         else:
-            log.append("GitHub cheat collection: skipped (no CRC resolved).")
+            log.append("GitHub cheat collection: skipped (no CRC).")
 
         try:
             results = fetch_and_cache_cheats(game.serial) or []
         except Exception as e:
             results = []
-            log.append(f"Online search failed: {e}")
-        codes = [
-            {'name': entry.get('title') or entry.get('source', 'Cheat'),
-             'description': entry.get('source', ''),
-             'codes': entry['codes']}
-            for entry in results if entry.get('codes')
-        ]
-        if codes:
-            log.append(f"Online search (GameHacking.org, PSXDataCenter): found {len(codes)} cheat(s).")
-            for c in codes:
-                if c['name'] not in seen_names:
-                    seen_names.add(c['name'])
-                    all_codes.append(c)
-        else:
-            log.append("Online search (GameHacking.org, PSXDataCenter): nothing found.")
+            log.append(f"GameHacking.org / PSXDataCenter: failed ({e}).")
+        codes = [{'name': e.get('title') or e.get('source', 'Cheat'), 'description': e.get('source', ''), 'codes': e['codes']}
+                 for e in results if e.get('codes')]
+        n = add(codes, 'GameHacking.org')
+        log.append(f"GameHacking.org / PSXDataCenter: {n} more cheat(s)." if n else "GameHacking.org / PSXDataCenter: nothing new.")
 
         already = self._cheats_already_installed(cheats_dir, game.crc) if game.crc else False
-        return all_codes, "from online sources", log, already
+        note = "from " + (", ".join(sources) if sources else "no source")
+        return out, note, log, already
+
+    TEXTURE_SEARCH_LIMIT = 5     # best unverified hits checked for a real downloadable .zip/.7z
 
     def _gather_texture_candidates(self, game: GameEntry, textures_dir: str):
-        """Look up what texture packs are available: the curated manifest first,
-        then unverified search across every source this app can actually reach
-        automatically (GitHub repos, Internet Archive items) if nothing curated
-        exists. GBAtemp/forums.pcsx2.net (Cloudflare bot challenge) and mega.nz
-        (its own robots.txt disallows bot access to /file and /folder) aren't
-        searched automatically -- see the comment above search_archive_org_texture_packs().
-        Always searches (even if a pack is already installed) so the "reinstall
-        anyway" option in the dialog has candidates to choose from. Returns
-        (candidates, log_lines, already_installed)."""
+        """Texture packs for the game: the curated manifest, then GitHub and the
+        Internet Archive searched with several spellings of the title, every
+        hit scored for how well it matches this game, obvious mismatches
+        dropped, and the best GitHub hits checked for an actual download.
+        Returns (candidates best-first, log_lines, already_installed)."""
         existing_dir = texture_upscale.replacement_textures_dir(textures_dir, game.serial) if textures_dir else ''
         already_installed = bool(existing_dir and os.path.isdir(existing_dir) and os.listdir(existing_dir))
+        log = ["A pack is already installed; searched anyway so you can replace it."] if already_installed else []
 
-        log = []
-        if already_installed:
-            log.append("Already installed -- searched anyway in case you want to reinstall.")
-        curated = get_texture_pack_options(game.serial)
-        if curated:
-            log.append(f"Curated index: {len(curated)} verified option(s) found.")
-            return curated, log, already_installed
+        curated = [dict(c, verified=c.get('verified', True)) for c in get_texture_pack_options(game.serial)]
+        log.append(f"Curated list: {len(curated)} verified pack(s)." if curated else "Curated list: no entry for this game.")
+        found = list(curated)
 
-        log.append("Curated index: no entry for this game.")
-        search_results = []
-        if requests is None:
-            log.append("GitHub search: skipped (requests not installed).")
-            log.append("Internet Archive search: skipped (requests not installed).")
+        # The PS2 texture-pack catalog, keyed by disc serial: the most reliable
+        # source after our own list. Automatic downloads are checked for a real
+        # .zip/.7z; anything that can't be fetched becomes a browser link.
+        catalog, cat_err = texture_catalog.load(self.PATCH_CACHE_DIR)
+        if cat_err:
+            log.append(f"Texture-pack catalog: {cat_err}.")
+        known = {(c.get('github_repo') or c.get('archive_org_id') or '').lower() for c in curated}
+        cat = [c for c in texture_catalog.candidates_for(catalog, game.serial, game.title or "")
+               if (c.get('github_repo') or c.get('archive_org_id') or c.get('manual_url') or '').lower() not in known]
+        auto = 0
+        for c in cat:
+            if not c.get('manual_url'):
+                try:
+                    ok = bool(resolve_texture_source(c))
+                except Exception:
+                    ok = False
+                if ok:
+                    auto += 1
+                else:
+                    page = (f"https://archive.org/details/{c['archive_org_id']}" if c.get('archive_org_id')
+                            else f"https://github.com/{c.get('github_repo')}")
+                    c.pop('archive_org_id', None)
+                    c.pop('github_repo', None)
+                    c['manual_url'] = page
+            c['score'] = enhancements.CONFIDENCE_SCORE.get(c['confidence'], 80) - (10 if c.get('manual_url') else 0) \
+                - (20 if c.get('paid') else 0)
+            found.append(c)
+        if catalog:
+            paid = sum(1 for c in cat if c.get('paid'))
+            log.append(f"Texture-pack catalog: {len(cat)} pack(s) listed for this game"
+                       + (f" ({auto} downloadable here, {len(cat) - auto - paid} through your browser, {paid} paid)."
+                          if cat else "."))
+
+        if any(not c.get('manual_url') for c in found):
+            log.append("Online search: skipped, a listed pack is already available.")
+        elif requests is None:
+            log.append("Online search: skipped (requests isn't installed).")
         else:
-            gh_results, err = search_github_texture_packs(game.serial, game.title)
-            if err:
-                log.append(f"GitHub search: {err}")
-            elif gh_results:
-                log.append(f"GitHub search: {len(gh_results)} unverified candidate(s) found -- review before installing.")
-            else:
-                log.append("GitHub search: nothing found.")
-            search_results.extend(gh_results)
+            variants = enhancements.title_variants(game.title or "")[:2]
+            gh_all, ia_all = [], []
+            for v in variants:
+                gh, err = search_github_texture_packs(game.serial, v)
+                if err:
+                    log.append(f"GitHub search ({v}): {err}")
+                    break
+                gh_all += gh
+            for v in variants:
+                ia, err = search_archive_org_texture_packs(game.serial, v)
+                if err:
+                    log.append(f"Internet Archive search ({v}): {err}")
+                    break
+                ia_all += ia
+            ranked = enhancements.rank_texture_candidates(gh_all + ia_all, game.title or "", game.serial, game.crc or "")
+            dropped = len({(c.get('github_repo') or c.get('archive_org_id')) for c in gh_all + ia_all}) - len(ranked)
+            checked = 0
+            no_download = 0
+            for c in ranked:
+                if checked >= self.TEXTURE_SEARCH_LIMIT:
+                    break
+                # Only offer what can really be downloaded and unpacked (.zip/.7z).
+                checked += 1
+                try:
+                    c['downloadable'] = bool(resolve_texture_source(c))
+                except Exception:
+                    c['downloadable'] = False
+                if not c['downloadable']:
+                    no_download += 1
+                    continue
+                c['score'], c['confidence'] = enhancements.score_texture_candidate(c, game.title or "", game.serial, game.crc or "")
+                found.append(c)
+            if no_download:
+                log.append(f"Online search: {no_download} match(es) skipped because they have no .zip/.7z to download.")
+            log.append(f"Online search: {len(gh_all) + len(ia_all)} hit(s) for {', '.join(repr(v) for v in variants) or 'the title'}; "
+                       f"{len(found) - len(curated)} look like this game" + (f", {dropped} unrelated hit(s) hidden." if dropped > 0 else "."))
+        if textures_dir and texture_upscale.has_dumped_textures(textures_dir, game.serial):
+            found.append({'name': 'AI upscale of your own dumped textures (Real-ESRGAN)', 'ai_upscale': True,
+                          'verified': True, 'confidence': 'fallback', 'score': 1})
+            log.append("PCSX2 has dumped this game's textures, so an AI upscale is offered too.")
+        for c in found:
+            c.setdefault('confidence', 'verified' if c.get('verified', True) else 'medium')
+            c.setdefault('score', 100 if c['confidence'] == 'verified' else 50)
+        found.sort(key=lambda c: -c.get('score', 0))
+        return found, log, already_installed
 
-            ia_results, ia_err = search_archive_org_texture_packs(game.serial, game.title)
-            if ia_err:
-                log.append(f"Internet Archive search: {ia_err}")
-            elif ia_results:
-                log.append(f"Internet Archive search: {len(ia_results)} unverified candidate(s) found -- review before installing.")
-            else:
-                log.append("Internet Archive search: nothing found.")
-            search_results.extend(ia_results)
-
-        if not search_results and textures_dir and texture_upscale.has_dumped_textures(textures_dir, game.serial):
-            log.append("No pack found anywhere, but PCSX2 has dumped textures for this game -- "
-                        "offering an AI upscale (Real-ESRGAN) built from those instead.")
-            search_results = [{
-                'name': 'AI Upscale (Real-ESRGAN, from your dumped textures)',
-                'ai_upscale': True,
-                'verified': True,
-            }]
-        return search_results, log, already_installed
-
-    def _sync_selected(self):
-        game = self._selected_game()
-        if not game:
-            return
+    def _install_dirs(self) -> Tuple[Optional[dict], Optional[str]]:
         paths = self.parent.state.pcsx2_paths or {}
         cheats_dir = paths.get('cheats', '')
-        textures_dir = paths.get('textures', '')
         if not cheats_dir or not os.path.isdir(cheats_dir):
-            QMessageBox.warning(self, "PCSX2 Folder Not Set", "Set your PCSX2 folder in Settings (gear icon) first.")
+            return None, "Set your PCSX2 folder in Settings first."
+        t = self.parent.settings_tab
+        return {"cheats_dir": cheats_dir, "textures_dir": paths.get('textures', ''),
+                "patches_dir": paths.get('patches', ''), "data_dir": t.user_dir.text().strip(),
+                "ini": t._ini_path()}, None
+
+    def _gather_install_options(self, game: GameEntry, dirs: Optional[dict] = None):
+        """Everything about this game's enhancements -- what's available, what's
+        installed, what's switched on in PCSX2, what we recommend and what's in
+        the way -- without changing anything. Returns (options, None) or
+        (None, error). Touches no widgets: safe on a worker thread."""
+        if dirs is None:
+            dirs, err = self._install_dirs()
+            if err:
+                return None, err
+        log: List[str] = []
+        index, idx_err = patches_online.load_index(self.PATCH_CACHE_DIR)
+        self._resolve_crc(game, log, index)
+        cheats, cheat_note, cheat_log, cheats_installed = self._gather_cheat_candidates(game, dirs["cheats_dir"])
+        textures, texture_log, textures_installed = self._gather_texture_candidates(game, dirs["textures_dir"])
+        patches, patch_log = self._gather_patch_candidates(game, dirs["patches_dir"], index, idx_err)
+
+        ini = dirs.get("ini") or ""
+        has_ini = bool(ini) and os.path.isfile(ini)
+        flags = {k: (ini_get_bool(ini, k, s) if has_ini else None) for _l, _t, s, k in PCSX2_OPTIONS}
+        gs = enhancements.game_settings_path(dirs["data_dir"], game.serial, game.crc) if (game.crc and dirs.get("data_dir")) else ""
+        en_patch = set(enhancements.read_list(gs, enhancements.PATCHES_SECTION)) if gs else set()
+        dis_patch = set(enhancements.read_list(gs, enhancements.PATCHES_SECTION, "Disable")) if gs else set()
+        en_cheat = set(enhancements.read_list(gs, enhancements.CHEATS_SECTION)) if gs else set()
+        auto = {enhancements.WS_PATCH_NAME: flags.get("EnableWideScreenPatches"),
+                enhancements.NI_PATCH_NAME: flags.get("EnableNoInterlacingPatches")}
+        for p in patches:
+            for g in p["groups"]:
+                g.enabled = p["installed"] and (g.name in en_patch or (bool(auto.get(g.name)) and g.name not in dis_patch))
+        for c in cheats:
+            c["enabled"] = cheats_installed and enhancements.pnach_group_name(c.get("name")) in en_cheat
+        cheat_file = os.path.join(dirs["cheats_dir"], f"{game.crc.upper()}.pnach") if game.crc else ""
+        foreign = bool(cheat_file and os.path.isfile(cheat_file) and "Generated by PCTX" not in
+                       open(cheat_file, encoding="utf-8", errors="ignore").read(4096))
+
+        rec = enhancements.recommend(patches, textures)
+        checks = enhancements.health_checks(
+            crc=game.crc, crc_source=game.crc_source or "", has_ini=has_ini, ini_flags=flags,
+            cheats_installed=cheats_installed, cheats_enabled=sum(1 for c in cheats if c["enabled"]),
+            textures_installed=textures_installed, patches_installed=any(p["installed"] for p in patches),
+            patches_enabled=sum(1 for p in patches for g in p["groups"] if g.enabled),
+            ws_installed=any(p["installed"] and any(g.kind == "widescreen" for g in p["groups"]) for p in patches))
+        log = (log + ["", "Patches:"] + [f"  {l}" for l in patch_log] + ["", "Cheats:"] + [f"  {l}" for l in cheat_log]
+               + ["", "Textures:"] + [f"  {l}" for l in texture_log])
+        return dict(dirs, cheats=cheats, cheat_note=cheat_note, cheats_installed=cheats_installed, cheats_foreign=foreign,
+                    textures=textures, textures_installed=textures_installed, patches=patches, log=log,
+                    game_settings=gs, flags=flags, recommendation=rec, checks=checks), None
+
+    def _run_task(self, fn, on_done, on_progress=None, busy=True):
+        """Run `fn(progress)` on a worker thread; `on_done(result, error)` runs on
+        the UI thread afterwards. The UI stays fully interactive meanwhile."""
+        if busy:
+            self._set_busy(True)
+        worker = TaskWorker(fn, parent=self)
+        if on_progress:
+            worker.progressed.connect(on_progress)
+
+        def _finish(result, error):
+            if busy:
+                self._set_busy(False)
+            on_done(result, error)
+        worker.done.connect(_finish)
+        self._start_worker(worker)
+        return worker
+
+    def _gather_async(self, game: GameEntry, on_done):
+        """on_done(options, error) on the UI thread."""
+        dirs, err = self._install_dirs()
+        if err:
+            on_done(None, err)
             return
+        def _work(_progress):
+            return self._gather_install_options(game, dirs)
+        self._run_task(_work, lambda res, error: on_done(*(res if res else (None, error or "Search failed."))))
 
-        self.btn_sync.setEnabled(False)
-        self.result_label.setText("Searching…")
-        QApplication.processEvents()
+    def _apply_async(self, game: GameEntry, o: dict, sel: dict, on_done, on_progress=None):
+        """Install on a worker thread. on_done(results, followups) on the UI thread;
+        `followups` are things only the UI thread may do (open a URL, ask to
+        remember a texture source)."""
+        followups: list = []
 
-        cheat_candidates, cheat_source_note, cheat_log, cheats_installed = self._gather_cheat_candidates(game, cheats_dir)
-        texture_candidates, texture_log, textures_installed = self._gather_texture_candidates(game, textures_dir)
+        def _work(progress):
+            return self._apply_install(game, o, sel, progress=progress, followups=followups)
 
-        self.btn_sync.setEnabled(True)
-        self.result_label.setText("")
+        def _done(results, error):
+            self._save_library()
+            self._refresh_library(clear_status=True)
+            on_done(results or [f"Install failed: {error}"], followups)
+        self._run_task(_work, _done, on_progress)
 
-        search_log = ["Cheats:"] + [f"  {l}" for l in cheat_log] + ["", "Textures:"] + [f"  {l}" for l in texture_log]
-        dlg = SyncDialog(game, cheat_candidates, cheat_source_note, texture_candidates, search_log,
-                          cheats_installed, textures_installed, parent=self)
-        if dlg.exec() != QDialog.Accepted:
-            return
+    def _apply_install(self, game: GameEntry, o: dict, sel: dict, progress=None,
+                       followups: Optional[list] = None) -> List[str]:
+        """Make the game's enhancements match `sel`, and switch on in PCSX2 what
+        is needed for them to actually run. Runs on a worker thread: no widgets.
 
-        results = []
-        if cheats_installed and not dlg.cheats_will_overwrite():
-            results.append("Cheats: already installed, left unchanged.")
-        else:
-            selected_cheats = dlg.selected_cheats()
-            if not selected_cheats:
-                self._set_status(self.cheats_status_label, "Skipped")
-                results.append("Cheats: nothing selected, skipped.")
-            elif not game.crc:
-                self._set_status(self.cheats_status_label, "No CRC available", "warning")
-                results.append("Cheats: couldn't determine a CRC to install with.")
+        sel = {"patches": {file_index: [group names to enable]}, "cheats": [indices to enable],
+               "cheatsOverwrite": bool, "texture": index | -1, "texturesOverwrite": bool,
+               "remove": {"cheats", "patches", "textures"} subset, "fixes": [PCSX2.ini keys to turn on]}"""
+        progress = progress or (lambda _t: None)
+        followups = followups if followups is not None else []
+        results: List[str] = []
+        remove = set(sel.get("remove") or [])
+        gs = o.get("game_settings") or ""
+        ini = o.get("ini") or ""
+        flags = o.get("flags") or {}
+        sections = {k: s for _l, _t, s, k in PCSX2_OPTIONS}
+
+        def turn_on(key: str, why: str):
+            if ini and os.path.isfile(ini) and flags.get(key) is False and ini_set_bool(ini, key, True, sections[key]):
+                flags[key] = True
+                results.append(f"PCSX2: turned on \"{why}\".")
+
+        # ---- patches ----
+        chosen: Dict[int, List[str]] = {int(k): list(v) for k, v in (sel.get("patches") or {}).items()}
+        all_names = [g.name for p in o["patches"] for g in p["groups"]]
+        if "patches" in remove:
+            n = 0
+            for p in o["patches"]:
+                path = patches_online.installed_path(o["patches_dir"], p["file"])
+                if os.path.isfile(path):
+                    os.remove(path)
+                    n += 1
+            if gs:
+                enhancements.set_enabled(gs, enhancements.PATCHES_SECTION, [], all_names)
+            results.append(f"Patches: removed {n} file(s).")
+        elif o["patches"]:
+            installed, enable = 0, []
+            for i, p in enumerate(o["patches"]):
+                names = chosen.get(i, [])
+                if names or (p["always"] and i in chosen):
+                    progress(f"Installing {p['file'].filename}…")
+                    patches_online.install(p["file"], p["text"], o["patches_dir"])
+                    installed += 1
+                    enable += [n for n in names if n != "*"]
+            if gs:
+                auto = {enhancements.WS_PATCH_NAME: flags.get("EnableWideScreenPatches"),
+                        enhancements.NI_PATCH_NAME: flags.get("EnableNoInterlacingPatches")}
+                disable = [n for n in all_names if auto.get(n) and n not in enable]
+                enhancements.set_enabled(gs, enhancements.PATCHES_SECTION, enable, all_names, disable)
+            if installed or enable:
+                results.append(f"Patches: {installed} file(s) installed, {len(enable)} patch(es) switched on"
+                               + (f" ({', '.join(enable[:4])}{'…' if len(enable) > 4 else ''})." if enable else "."))
+                if enable and not gs:
+                    results.append("Patches: couldn't switch them on automatically (CRC unknown) -- enable them in "
+                                   "PCSX2's game properties > Patches.")
+            elif any(g.enabled for p in o["patches"] for g in p["groups"]):
+                results.append("Patches: all switched off.")
+
+        # ---- cheats ----
+        cheats = o["cheats"]
+        picked = [cheats[i] for i in (sel.get("cheats") or []) if isinstance(i, int) and 0 <= i < len(cheats)]
+        cheat_names = [enhancements.pnach_group_name(c.get("name")) for c in cheats]
+        if "cheats" in remove:
+            path = os.path.join(o["cheats_dir"], f"{game.crc.upper()}.pnach") if game.crc else ""
+            if path and os.path.isfile(path):
+                os.remove(path)
+            if gs:
+                enhancements.set_enabled(gs, enhancements.CHEATS_SECTION, [], cheat_names)
+            results.append("Cheats: removed.")
+        elif cheats and (picked or o["cheats_installed"]):
+            if not game.crc:
+                results.append("Cheats: can't be installed without the game's CRC -- add its disc image first.")
             else:
+                if o.get("cheats_foreign") and not sel.get("cheatsOverwrite"):
+                    results.append("Cheats: kept your existing cheat file (it wasn't made by PCTX).")
+                else:
+                    progress("Writing cheats…")
+                    # Every cheat goes in the file (so it can be toggled in PCSX2
+                    # later); only the chosen ones are switched on.
+                    write_cheats_pnach(game.title or game.serial, game.serial, game.crc, cheats, o["cheats_dir"])
+                if gs:
+                    enhancements.set_enabled(gs, enhancements.CHEATS_SECTION,
+                                             [enhancements.pnach_group_name(c.get("name")) for c in picked], cheat_names)
+                results.append(f"Cheats: {len(picked)} of {len(cheats)} switched on." if picked
+                               else f"Cheats: {len(cheats)} available, none switched on.")
+                if picked:
+                    turn_on("EnableCheats", "Enable cheats")
+
+        # ---- textures ----
+        textures = o["textures"]
+        tex_i = sel.get("texture", -1)
+        entry = textures[tex_i] if isinstance(tex_i, int) and 0 <= tex_i < len(textures) else None
+        if "textures" in remove:
+            d = texture_upscale.replacement_textures_dir(o["textures_dir"], game.serial)
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+            results.append("Texture pack: removed.")
+        elif entry:
+            if o["textures_installed"] and not sel.get("texturesOverwrite"):
+                results.append("Texture pack: one is already installed; left unchanged.")
+            else:
+                if o["textures_installed"]:
+                    shutil.rmtree(texture_upscale.replacement_textures_dir(o["textures_dir"], game.serial), ignore_errors=True)
+                line = self._install_texture_entry(game, o["textures_dir"], entry, progress, followups)
+                results.append(line.replace("Textures:", "Texture pack:", 1))
+                if "installed" in line.lower() or "upscaled" in line.lower():
+                    turn_on("LoadTextureReplacements", "Load texture replacements")
+
+        for key in sel.get("fixes") or []:
+            if key in sections:
+                turn_on(key, next(l for l, _t, s, k in PCSX2_OPTIONS if k == key))
+        if not results:
+            results.append("Nothing to change.")
+        return results
+
+    def _sync_selected(self):
+        """Classic: search in the background, then the Install dialog, then
+        install in the background with progress in the status bar."""
+        game = self._selected_game()
+        if not game or self._busy:
+            return
+        self.parent.show_progress(0, 0, "Looking up patches, cheats and texture packs…")
+
+        def _found(o, err):
+            self.parent.hide_progress()
+            if err:
+                self._notify(err, "Can't search", warn=True)
+                return
+            dlg = EnhancementsDialog(game, o, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            self.parent.show_progress(0, 0, "Applying…")
+            self._apply_async(game, o, dlg.selection(), on_done=_installed,
+                              on_progress=lambda t: self.parent.show_progress(0, 0, t))
+
+        def _installed(results, followups):
+            self.parent.hide_progress()
+            self._run_followups(followups, ask=True)
+            self._report(results)
+
+        self._gather_async(game, _found)
+
+    def _run_followups(self, followups: list, ask: bool) -> list:
+        """Do the UI-thread parts of an install. Returns the texture sources that
+        could be remembered when `ask` is False (Big Picture shows its own prompt)."""
+        offers = []
+        for f in followups:
+            if f[0] == "open_url":
+                QDesktopServices.openUrl(QUrl(f[1]))
+            elif f[0] == "offer_source":
+                if ask:
+                    self._offer_save_texture_source(*f[1:])
+                else:
+                    offers.append(f[1:])
+        return offers
+
+    PATCH_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".pcsx2_manager_cache")
+
+    PATCH_TEXT_MAX_AGE = 7 * 24 * 3600
+
+    def _patch_text(self, pf) -> str:
+        """A patch file's text, cached for a week (they're tiny and rarely change)."""
+        path = os.path.join(self.PATCH_CACHE_DIR, "pnach", pf.filename)
+        try:
+            if os.path.isfile(path) and time.time() - os.path.getmtime(path) < self.PATCH_TEXT_MAX_AGE:
+                with open(path, encoding="utf-8") as f:
+                    return f.read()
+        except OSError:
+            pass
+        text = patches_online.fetch_text(pf)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+        return text
+
+    def _gather_patch_candidates(self, game: GameEntry, patches_dir: str, index=None, idx_err=None):
+        """PCSX2's published patch files for this game, each with its named
+        groups classified (widescreen / no-interlacing / fix / frame rate / ...).
+        Returns (candidates, log_lines)."""
+        if index is None:
+            index, idx_err = patches_online.load_index(self.PATCH_CACHE_DIR)
+        log = []
+        if idx_err:
+            log.append(f"PCSX2 patch collection: {idx_err}.")
+        files, exact = patches_online.find_for_game(index or [], game.serial, game.crc)
+        if not files:
+            if index:
+                log.append("PCSX2 patch collection: nothing published for this game.")
+            return [], log
+        log.append(f"PCSX2 patch collection: {len(files)} file(s) for {game.serial}"
+                   + (f", one matches your CRC {game.crc}." if exact else
+                      " (your CRC is unknown or different, so every revision is offered)."))
+        out = []
+        for pf in files:
+            try:
+                text = self._patch_text(pf)
+            except Exception as e:
+                log.append(f"  {pf.filename}: download failed ({e}).")
+                continue
+            groups = enhancements.parse_groups(text)
+            installed = patches_online.is_installed(patches_dir, pf)
+            update = False
+            if installed:
                 try:
-                    write_cheats_pnach(game.title or game.serial, game.serial, game.crc, selected_cheats, cheats_dir)
-                    verb = "Reinstalled" if cheats_installed else "Installed"
-                    self._set_status(self.cheats_status_label, f"{len(selected_cheats)} code(s) installed", "success")
-                    results.append(f"Cheats: {verb.lower()} {len(selected_cheats)} selected code(s), replacing the whole cheat file.")
-                    self._save_library()
-                except Exception as e:
-                    self._set_status(self.cheats_status_label, "Error", "error")
-                    logger.error(f"[LibraryView] Cheats install failed for {game.serial}: {e}")
-                    results.append(f"Cheats: error -- {e}")
-
-        if textures_installed and not dlg.textures_will_overwrite():
-            results.append("Textures: already installed, left unchanged.")
-        else:
-            selected_texture = dlg.selected_texture_entry()
-            if not selected_texture:
-                self._set_status(self.textures_status_label, "Skipped")
-                results.append("Textures: nothing selected, skipped.")
+                    with open(patches_online.installed_path(patches_dir, pf), encoding="utf-8", errors="ignore") as f:
+                        update = f.read().strip() != text.strip()
+                except OSError:
+                    pass
+            if update:
+                log.append(f"  {pf.filename}: PCSX2 has published a newer version than the one installed.")
+            out.append({"file": pf, "exact": exact and (not game.crc or pf.crc == game.crc.upper()), "text": text,
+                        "installed": installed, "update": update, "groups": groups, "always": not groups})
+            if groups:
+                log.append(f"  {pf.filename}: " + ", ".join(g.name for g in groups))
             else:
-                results.append(self._install_texture_entry(game, textures_dir, selected_texture))
+                log.append(f"  {pf.filename}: fixes that are always on once installed.")
+        return out, log
 
-        self.result_label.setText("\n".join(results))
+    def _install_patches(self, game: GameEntry, patches_dir: str, selected: list) -> str:
+        if not selected:
+            return "Patches: none selected."
+        if not patches_dir:
+            return "Patches: PCSX2's data folder isn't set."
+        names, failed = [], 0
+        for pf in selected:
+            try:
+                text = patches_online.fetch_text(pf)
+                patches_online.install(pf, text, patches_dir)
+                for name, _desc in patches_online.describe_groups(text):
+                    if name not in names:
+                        names.append(name)
+            except Exception as e:
+                failed += 1
+                logger.warning(f"[patches] {pf.filename}: {e}")
+        done = len(selected) - failed
+        msg = f"Patches: installed {done} file(s)" + (f" ({', '.join(names[:4])})" if names else "")
+        return msg + (f"; {failed} failed to download." if failed else ".")
 
-    def _install_texture_entry(self, game: GameEntry, textures_dir: str, entry: dict) -> str:
+    def _patch_all_games(self, confirm: bool = True) -> Optional[str]:
+        """Returns an error message (Big Picture shows it), or None once started."""
+        paths = self.parent.state.pcsx2_paths or {}
+        patches_dir = paths.get('patches', '')
+        if not patches_dir or not os.path.isdir(os.path.dirname(patches_dir)):
+            if confirm:
+                self._notify("Set PCSX2's data folder in Settings first.", "PCSX2 folder not set", warn=True)
+            return "Set PCSX2's data folder in Settings first."
+        if not self.games:
+            if confirm:
+                self._notify("Your library is empty.", "No games")
+            return "Your library is empty."
+        if self._busy:
+            return "PCTX is busy with something else; try again in a moment."
+        reply = QMessageBox.Yes if not confirm else QMessageBox.question(
+            self, "Recommended patches for all games",
+            f"Install the patches PCSX2 publishes for the {len(self.games)} game(s) in your library, and switch on "
+            f"the recommended ones (widescreen, no-interlacing and bug fixes) for each exact disc?\n\n"
+            "They are small text files from PCSX2's own patch collection. Frame-rate unlocks and visual tweaks are "
+            "installed but left off; turn them on per game in Enhancements.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes:
+            return
+        self._set_busy(True)
+        self.parent.show_progress(0, len(self.games), "Patches")
+        worker = PatchAllWorker([(g.serial, g.crc) for g in self.games.values()], patches_dir,
+                                self.PATCH_CACHE_DIR, parent=self,
+                                data_dir=self.parent.settings_tab.user_dir.text().strip())
+        worker.progressed.connect(lambda done, total: self.parent.show_progress(done, total, "Patches"))
+        worker.summary.connect(self._on_patch_all_done)
+        self._start_worker(worker)
+
+    def _on_patch_all_done(self, s: dict):
+        self.parent.hide_progress()
+        self._set_busy(False)
+        if s.get("error"):
+            self._report([f"Patches: {s['error']}."])
+            return
+        self._report([f"Patches: {s['installed']} new file(s) for {s['with_patches']} of {s['games']} games"
+                      f" ({s['skipped']} already installed" + (f", {s['failed']} failed" if s['failed'] else "") + ")"
+                      f"; recommended patches switched on for {s['switched_on']} game(s)."])
+        self._refresh_library()
+
+    def _install_texture_entry(self, game: GameEntry, textures_dir: str, entry: dict,
+                               progress=None, followups: Optional[list] = None) -> str:
+        progress = progress or (lambda _t: None)
+        followups = followups if followups is not None else []
         if entry.get('ai_upscale'):
-            return self._install_ai_upscale(game, textures_dir)
+            return self._install_ai_upscale(game, textures_dir, progress)
         if entry.get('manual_url'):
             # A source this app won't fetch automatically (e.g. a mega.nz link
             # found by hand) -- open it for the user instead of pretending it's
             # a normal download.
-            QDesktopServices.openUrl(QUrl(entry['manual_url']))
-            self._set_status(self.textures_status_label, "Opened link -- install manually", "warning")
+            followups.append(("open_url", entry['manual_url']))
             dest = os.path.join(textures_dir, game.serial, texture_upscale.TEXTURE_REPLACEMENT_SUBDIR)
             return (f"Textures: '{entry.get('name', 'this pack')}' opened in your browser -- "
                     f"this app can't auto-download from that host, so extract it into {dest} yourself.")
         try:
             resolved = resolve_texture_source(entry)
             if not resolved or not resolved[2]:
-                self._set_status(self.textures_status_label, "Install failed", "error")
                 return "Textures: couldn't resolve a download for the selected pack."
             display_name, source_label, download_url = resolved
 
@@ -6924,12 +8258,19 @@ class LibraryView(QWidget):
             tmp_dir = os.path.join(os.path.expanduser('~'), '.pcsx2_manager_tmp')
             os.makedirs(tmp_dir, exist_ok=True)
             local_archive = os.path.join(tmp_dir, f"{game.serial}_texture_pack{ext}")
+            progress(f"Downloading {display_name}…")
             resp = requests.get(download_url, timeout=60, stream=True)
             resp.raise_for_status()
+            total = int(resp.headers.get('content-length') or 0)
+            got = 0
             with open(local_archive, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            progress(f"Downloading {display_name}… {got * 100 // total}%")
+            progress("Extracting texture pack…")
 
             # PCSX2 only loads texture replacements from <textures_dir>/<serial>/replacements/
             # (confirmed against its GSTextureReplacements.cpp source) -- installing straight
@@ -6946,55 +8287,34 @@ class LibraryView(QWidget):
                 pass
 
             if installed:
-                self._set_status(self.textures_status_label, f"Installed ({display_name})", "success")
                 if not entry.get('verified', True):
-                    self._offer_save_texture_source(game.serial, entry, download_url)
+                    followups.append(("offer_source", game.serial, entry, download_url))
                 return f"Textures: installed '{display_name}' from {source_label}."
             msg = failures[0][2] if failures else "install failed"
-            self._set_status(self.textures_status_label, "Install failed", "error")
             return f"Textures: found a pack but install failed -- {msg}"
         except Exception as e:
-            self._set_status(self.textures_status_label, "Error", "error")
             logger.error(f"[LibraryView] Textures install failed for {game.serial}: {e}")
             return f"Textures: error -- {e}"
 
-    def _install_ai_upscale(self, game: GameEntry, textures_dir: str) -> str:
+    def _install_ai_upscale(self, game: GameEntry, textures_dir: str, progress=None) -> str:
         """Batch-upscale whatever PCSX2 has already dumped for this game (its
         own "Dump Textures" graphics option) with Real-ESRGAN, writing the
-        result straight into the replacements/ folder PCSX2 loads from."""
+        result straight into the replacements/ folder PCSX2 loads from.
+        Runs on the install worker thread; progress goes to `progress`."""
+        progress = progress or (lambda _t: None)
         src_dir = texture_upscale.dumped_textures_dir(textures_dir, game.serial)
         dst_dir = texture_upscale.replacement_textures_dir(textures_dir, game.serial)
         tools_dir = os.path.join(os.path.expanduser('~'), '.pcsx2_manager_tools')
         os.makedirs(tools_dir, exist_ok=True)
-
-        progress_dlg = QProgressDialog("Preparing Real-ESRGAN…", "", 0, 0, self)
-        progress_dlg.setWindowTitle("AI Texture Upscale")
-        progress_dlg.setWindowModality(Qt.WindowModal)
-        progress_dlg.setCancelButton(None)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.show()
-
-        loop = QEventLoop()
-        result = {}
-        worker = AIUpscaleWorker(src_dir, dst_dir, tools_dir, parent=self)
-        worker.progress.connect(progress_dlg.setLabelText)
-
-        def _done(ok, msg):
-            result['ok'] = ok
-            result['msg'] = msg
-            loop.quit()
-
-        worker.done.connect(_done)
-        worker.start()
-        loop.exec()
-        progress_dlg.close()
-        worker.wait(2000)
-
-        if result.get('ok'):
-            self._set_status(self.textures_status_label, "AI-upscaled from dumps", "success")
-            return f"Textures: {result['msg']} (AI-upscaled from your dumped textures with Real-ESRGAN)."
-        self._set_status(self.textures_status_label, "AI upscale failed", "error")
-        return f"Textures: {result.get('msg', 'AI upscale failed.')}"
+        progress("Preparing Real-ESRGAN…")
+        exe = texture_upscale.ensure_realesrgan_binary(tools_dir, progress_cb=progress)
+        if not exe:
+            return "Textures: couldn't get Real-ESRGAN (check your internet connection)."
+        progress("Upscaling textures… this can take a few minutes for a large dump.")
+        ok, msg = texture_upscale.upscale_textures(exe, src_dir, dst_dir, scale=4)
+        if ok:
+            return f"Textures: {msg} (AI-upscaled from your dumped textures with Real-ESRGAN)."
+        return f"Textures: {msg}"
 
     def _offer_save_texture_source(self, serial: str, entry: dict, download_url: str):
         """After a successful install from an unverified search result (GitHub
@@ -7023,9 +8343,8 @@ class LibraryView(QWidget):
             QMessageBox.warning(self, "Couldn't Save", "Failed to update texture_sources.json.")
 
     def _game_install_status(self, game: GameEntry) -> Tuple[bool, bool]:
-        """(cheats_installed, textures_installed) from what's actually on disk --
-        shared by the detail panel, the Install button label, and the per-game
-        status badges in the library list/grid."""
+        """(cheats_installed, textures_installed) from what's actually on disk,
+        so the library shows the real state even after restarting the app."""
         paths = self.parent.state.pcsx2_paths or {}
         cheats_dir = paths.get('cheats', '')
         textures_dir = paths.get('textures', '')
@@ -7043,23 +8362,15 @@ class LibraryView(QWidget):
 
         return cheats_installed, textures_installed
 
-    def _refresh_installed_status(self, game: GameEntry):
-        """Reflect what's actually on disk for this game, not just what happened
-        during this app session -- otherwise a game synced in a previous session
-        always shows "Not synced yet" again after restarting the app."""
-        cheats_installed, textures_installed = self._game_install_status(game)
-
-        if cheats_installed:
-            self._set_status(self.cheats_status_label, "Already installed", "warning")
+    def _report(self, results: List[str]):
+        """Show the outcome of an install -- status bar in Classic, a toast over
+        the page in Big Picture (where there is no status bar) -- and refresh
+        the Installed columns/badges from what is now on disk."""
+        self._refresh_library(clear_status=True)
+        if self.ui_mode == theme.MODE_BIG_PICTURE:
+            self.bp.show_toast("\n".join(results))
         else:
-            self._set_status(self.cheats_status_label, "Not synced yet")
-
-        if textures_installed:
-            self._set_status(self.textures_status_label, "Already installed", "warning")
-        else:
-            self._set_status(self.textures_status_label, "Not synced yet")
-
-        self.btn_sync.setText("Re-install" if (cheats_installed or textures_installed) else "Install")
+            self.parent.flash_status("  ·  ".join(results), 20000)
 
     @staticmethod
     def _cheats_already_installed(cheats_dir: str, crc: str) -> bool:
@@ -7078,7 +8389,7 @@ class LibraryView(QWidget):
             except ValueError:
                 pass
             worker.deleteLater()
-        worker.finished.connect(_cleanup)
+        release_worker_when_done(worker, _cleanup)
         worker.start()
 
 
@@ -7090,10 +8401,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.state = AppState()
-        self.setWindowTitle("PCSX2 Manager")
+        self.ui_mode = theme.MODE_CLASSIC
+        self._was_maximized = False
+        self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(APP_ICON_ICO_PATH))
-        self.resize(1100, 750)
-        self.setMinimumSize(760, 480)
+        self.resize(1180, 760)
+        self.setMinimumSize(820, 520)
 
         # Custom-drawn title bar (TitleBar/ResizableFrame above). On Windows we keep
         # the window fully native (see nativeEvent()) so Snap/shadow/rounded-corners
@@ -7101,44 +8414,96 @@ class MainWindow(QMainWindow):
         if not IS_WINDOWS:
             self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
 
-        # Apply the shared dark theme (see theme.py for tokens/QSS)
-        self.setStyleSheet(theme.DARK_QSS)
-
-        frame = ResizableFrame(self)
-        outer = QVBoxLayout(frame)
-        outer.setContentsMargins(theme.RESIZE_MARGIN, 0, theme.RESIZE_MARGIN, theme.RESIZE_MARGIN)
-        outer.setSpacing(0)
+        self.frame = ResizableFrame(self)
+        self.outer = QVBoxLayout(self.frame)
+        self.outer.setSpacing(0)
+        self._set_frame_margins(True)
 
         self.title_bar = TitleBar(self)
-        outer.addWidget(self.title_bar)
+        self.outer.addWidget(self.title_bar)
 
-        # These are no longer shown as tabs (see LibraryView) but stay alive,
-        # unparented until opened, for the Advanced dialogs and existing
-        # paths_changed/current_game_changed signal wiring in their __init__.
-        self.cheats_tab = CheatsTab(self)
-        self.textures_tab = TexturesTab(self)
+        # The Advanced Cheat Editor / Texture Manager are big legacy widgets that
+        # most sessions never open; they're built on first use (see the
+        # cheats_tab / textures_tab properties) instead of at every startup.
+        self._cheats_tab: Optional['CheatsTab'] = None
+        self._textures_tab: Optional['TexturesTab'] = None
         self.settings_tab = SettingsTab(self)
 
+        self._build_status_bar()
         self.library_view = LibraryView(self)
+        self.outer.addWidget(self.library_view, 1)
+        self.outer.addWidget(self.status_bar)
+        self._build_menus(self.title_bar.menu_bar)
 
-        self.boot_screen = ps2_ui.BootScreenWidget()
-        self.boot_screen.finished.connect(self._on_boot_finished)
-
-        self.ring_menu = ps2_ui.RingMenuWidget([("library", "Library"), ("settings", "Settings")])
-        self.ring_menu.optionChosen.connect(self._on_ring_option_chosen)
-
-        self.main_stack = QStackedWidget()
-        self.main_stack.addWidget(self.boot_screen)
-        self.main_stack.addWidget(self.ring_menu)
-        self.main_stack.addWidget(self.library_view)
-        outer.addWidget(self.main_stack, 1)
-
-        self.setCentralWidget(frame)
-
+        self.setCentralWidget(self.frame)
         self.setAcceptDrops(True)
 
-        # Show welcome message on first run
+        # Theme + visibility for the remembered mode. The window itself is
+        # shown (fullscreen or not) by show_initial().
+        self.set_ui_mode(app_settings().value('ui/mode', theme.MODE_CLASSIC, str), initial=True)
         self._show_welcome_if_needed()
+
+    @property
+    def cheats_tab(self) -> 'CheatsTab':
+        if self._cheats_tab is None:
+            self._cheats_tab = CheatsTab(self)
+            self._cheats_tab.load_paths(self.state.pcsx2_paths or {})
+        return self._cheats_tab
+
+    @property
+    def textures_tab(self) -> 'TexturesTab':
+        if self._textures_tab is None:
+            self._textures_tab = TexturesTab(self)
+            self._textures_tab.load_paths(self.state.pcsx2_paths or {})
+        return self._textures_tab
+
+    def _set_frame_margins(self, classic: bool):
+        m = theme.RESIZE_MARGIN if classic else 0
+        self.outer.setContentsMargins(m, 0, m, m)
+
+    def _build_status_bar(self):
+        self.status_bar = QStatusBar()
+        self.status_bar.setSizeGripEnabled(False)
+        self.status_hint = QLabel("")
+        self.status_hint.setObjectName(theme.OBJ_MUTED_LABEL)
+        self.status_count = QLabel("")
+        self.status_count.setObjectName(theme.OBJ_MUTED_LABEL)
+        self.status_progress = QProgressBar()
+        self.status_progress.setFixedWidth(180)
+        self.status_progress.setFixedHeight(16)
+        self.status_progress.setVisible(False)
+        self.status_bar.addWidget(self.status_hint, 1)
+        self.status_bar.addPermanentWidget(self.status_progress)
+        self.status_bar.addPermanentWidget(self.status_count)
+
+    # ---- status bar API (used by LibraryView) ----
+    def set_status_hint(self, text: str):
+        self.status_hint.setText(text)
+
+    def flash_status(self, text: str, ms: int = 6000):
+        if text:
+            self.status_bar.showMessage(text, ms)
+        else:
+            self.status_bar.clearMessage()
+
+    def set_library_count(self, total: int, shown: int):
+        if not total:
+            self.status_count.setText("")
+        elif shown != total:
+            self.status_count.setText(f"{shown} of {total} games")
+        else:
+            self.status_count.setText(f"{total} game{'s' if total != 1 else ''}")
+
+    def show_progress(self, current: int, total: int, label: str = ""):
+        self.status_progress.setRange(0, total)
+        if total:
+            self.status_progress.setValue(current)
+        self.status_progress.setFormat(f"{label} %p%" if total else label)
+        self.status_progress.setTextVisible(True)
+        self.status_progress.setVisible(True)
+
+    def hide_progress(self):
+        self.status_progress.setVisible(False)
 
     # ---- Windows native chrome: keep Snap/shadow while hiding the native title bar ----
     def nativeEvent(self, eventType, message):
@@ -7187,6 +8552,9 @@ class MainWindow(QMainWindow):
         # skipping this conversion made the resize-edge hit-test region several
         # times wider than the visible 6px border -- wide enough to swallow clicks
         # on real content near the window edges.
+        if self.isFullScreen() or not self.title_bar.isVisible():
+            # Big Picture is fullscreen: no resize edges, no caption to drag.
+            return False, HT_CLIENT
         dpr = self.devicePixelRatioF() or 1.0
         pos = self.mapFromGlobal(QPoint(int(x / dpr), int(y / dpr)))
         w, h = self.width(), self.height()
@@ -7219,42 +8587,69 @@ class MainWindow(QMainWindow):
         local = QPoint(pos.x() - tb_origin.x(), pos.y() - tb_origin.y())
         if 0 <= local.x() <= tb.width() and 0 <= local.y() <= tb.height():
             child = tb.childAt(local)
-            if isinstance(child, QToolButton):
+            # Anything interactive stays a normal client-area widget; only the
+            # empty strip and the icon/name labels act as the draggable caption.
+            if child is not None and not isinstance(child, QLabel):
                 return False, HT_CLIENT
             return True, HT_CAPTION
         return False, HT_CLIENT
 
+    # ---- display modes ----
+    def set_ui_mode(self, mode: str, initial: bool = False):
+        """Switch between Classic and Big Picture. Big Picture hides the title
+        bar/status bar and goes fullscreen; Classic restores the window as it was."""
+        if mode not in (theme.MODE_CLASSIC, theme.MODE_BIG_PICTURE):
+            mode = theme.MODE_CLASSIC
+        if mode == self.ui_mode and not initial:
+            return
+        big = mode == theme.MODE_BIG_PICTURE
+        if big and not initial:
+            self._was_maximized = self.isMaximized()
+        self.ui_mode = mode
+
+        app = QApplication.instance()
+        if app is not None:
+            theme.apply_theme(app, mode)
+        self.title_bar.setVisible(not big)
+        self.status_bar.setVisible(not big)
+        self._set_frame_margins(not big)
+        self.library_view.set_ui_mode(mode)
+        app_settings().setValue('ui/mode', mode)
+
+        if not initial:
+            if big:
+                self.showFullScreen()
+            elif self._was_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+
+    def toggle_ui_mode(self):
+        self.set_ui_mode(theme.MODE_CLASSIC if self.ui_mode == theme.MODE_BIG_PICTURE else theme.MODE_BIG_PICTURE)
+
+    def show_initial(self):
+        """Show the window the way it was left: fullscreen if Big Picture."""
+        if self.ui_mode == theme.MODE_BIG_PICTURE:
+            self.showFullScreen()
+        else:
+            self.show()
+
     def open_settings_dialog(self):
-        self._open_widget_dialog(self.settings_tab, "Settings", size=(640, 700))
-
-    def _on_boot_finished(self):
-        self.show_ring_menu()
-
-    def _on_ring_option_chosen(self, key: str):
-        if key == "library":
-            self.main_stack.setCurrentWidget(self.library_view)
-        elif key == "settings":
-            self.open_settings_dialog()
-
-    def show_ring_menu(self):
-        self.main_stack.setCurrentWidget(self.ring_menu)
-        self.ring_menu.setFocus()
+        self._open_widget_dialog(self.settings_tab, "Settings", size=(680, 480))
+        self.library_view.refresh()  # PCSX2 paths/exe may have changed
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Re-request focus for whichever stack page is current every time the
-        # window is (re)shown -- e.g. after being minimized and restored.
+        # Re-request focus for the library every time the window is (re)shown --
+        # e.g. after being minimized and restored.
         # Skip this while a modal dialog (Install, Add Game, Settings, ...) is
         # open: Windows can send the owner window a show/activate notification
         # while an owned dialog appears, which re-enters this handler and yanks
-        # keyboard focus back to the background WebEngineView screen -- making
-        # the dialog's own widgets look unclickable even though it's genuinely
-        # on top and visible.
+        # keyboard focus away from the dialog's own widgets -- making them look
+        # unclickable even though the dialog is genuinely on top and visible.
         if QApplication.activeModalWidget() is not None:
             return
-        current = self.main_stack.currentWidget()
-        if current is not None:
-            current.setFocus()
+        self.library_view.focus_active()
 
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
@@ -7271,27 +8666,67 @@ class MainWindow(QMainWindow):
                 self.textures_tab.dropEvent(e)
                 break
 
-    def build_app_menu(self) -> QMenu:
-        """Menu shown from the title bar's hamburger button, replacing the
-        native QMainWindow menu bar so the custom title bar is the only header."""
-        menu = QMenu(self)
-        about_act = QAction("About", self)
-        about_act.triggered.connect(self._about)
-        menu.addAction(about_act)
-        menu.addSeparator()
+    def _build_menus(self, mb: QMenuBar):
+        """PCSX2-style menu bar, living inside the custom title bar."""
+        lv = self.library_view
+        m = mb.addMenu("&File")
+        m.addAction(lv.act_scan)
+        m.addAction(lv.act_add)
+        m.addSeparator()
+        m.addAction(lv.act_settings)
+        m.addSeparator()
+        quit_act = QAction("E&xit", self)
+        quit_act.setShortcut(QKeySequence("Ctrl+Q"))
+        quit_act.triggered.connect(self.close)
+        m.addAction(quit_act)
 
+        m = mb.addMenu("&View")
+        m.addAction(lv.act_view_list)
+        m.addAction(lv.act_view_grid)
+        m.addSeparator()
+        m.addAction(lv.act_zoom_in)
+        m.addAction(lv.act_zoom_out)
+        m.addSeparator()
+        m.addAction(lv.act_find)
+        m.addSeparator()
+        m.addAction(lv.act_big_picture)
+
+        m = mb.addMenu("&Tools")
+        for a in (lv.act_install, lv.act_patch_all, lv.act_launch, lv.act_folder, lv.act_remove):
+            m.addAction(a)
+        m.addSeparator()
         cheats_act = QAction("Advanced Cheat Editor…", self)
         cheats_act.triggered.connect(self.open_advanced_cheats)
-        menu.addAction(cheats_act)
+        m.addAction(cheats_act)
         textures_act = QAction("Advanced Texture Manager…", self)
         textures_act.triggered.connect(self.open_advanced_textures)
-        menu.addAction(textures_act)
-        menu.addSeparator()
+        m.addAction(textures_act)
 
-        exit_act = QAction("Exit", self)
-        exit_act.triggered.connect(self.close)
-        menu.addAction(exit_act)
-        return menu
+        m = mb.addMenu("&Help")
+        keys_act = QAction("Keyboard Shortcuts…", self)
+        keys_act.triggered.connect(self._show_shortcuts)
+        m.addAction(keys_act)
+        about_act = QAction(f"About {APP_NAME}", self)
+        about_act.triggered.connect(self._about)
+        m.addAction(about_act)
+
+    def _show_shortcuts(self):
+        QMessageBox.information(
+            self, "Keyboard Shortcuts",
+            "<table cellpadding='3'>"
+            "<tr><td><b>Ctrl+O</b></td><td>Scan folder</td></tr>"
+            "<tr><td><b>Ctrl+N</b></td><td>Add game</td></tr>"
+            "<tr><td><b>Enter</b></td><td>Install for the selected game</td></tr>"
+            "<tr><td><b>Ctrl+L</b></td><td>Launch in PCSX2</td></tr>"
+            "<tr><td><b>Del</b></td><td>Remove from library</td></tr>"
+            "<tr><td><b>Ctrl+F</b></td><td>Search</td></tr>"
+            "<tr><td><b>Ctrl+1 / Ctrl+2</b></td><td>List / grid view</td></tr>"
+            "<tr><td><b>Ctrl+, </b></td><td>Settings</td></tr>"
+            "<tr><td><b>F11</b></td><td>Switch Classic &harr; Big Picture</td></tr>"
+            "</table>"
+            "<p>In Big Picture: arrow keys or controller D-pad to move, Enter/A to select, "
+            "Esc/B to go back, G/Y for grid, +/- or LB/RB to zoom.</p>"
+        )
 
     def _open_widget_dialog(self, widget: QWidget, title: str, size=(900, 700)):
         """Host an existing tab widget (Cheats/Textures/Settings) in a one-off
@@ -7302,7 +8737,6 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(widget)
-        effects.fade_in(dlg)
         dlg.exec()
         lay.removeWidget(widget)
         widget.setParent(self)
@@ -7321,41 +8755,32 @@ class MainWindow(QMainWindow):
     def _about(self):
         QMessageBox.information(
             self,
-            "About PCSX2 Manager",
-            "<h2>PCSX2 Manager</h2>"
-            "<p><b>Version 2.0</b></p>"
-            "<p>A simplified tool for managing PCSX2 cheats and texture packs.</p>"
-            "<br>"
-            "<p><b>Features:</b></p>"
+            f"About {APP_NAME}",
+            f"<h3>{APP_NAME} 2.0</h3>"
+            "<p>Cheats and texture packs for your PCSX2 game library.</p>"
             "<ul>"
-            "<li>Scan a folder to build your game library</li>"
-            "<li>One-click cheat + texture pack sync per game</li>"
-            "<li>Region-correct cheat installation with an online database</li>"
-            "<li>Drag & drop support</li>"
+            "<li>Scan a folder to build your library</li>"
+            "<li>Install a game's cheats and texture pack in one step</li>"
+            "<li>Region-correct cheats from a bundled database, with online fallbacks</li>"
+            "<li>Classic desktop view and a fullscreen Big Picture mode (F11)</li>"
             "</ul>"
-            "<br>"
-            "<p><i>Tip: Click the gear icon in the title bar for Settings.</i></p>"
         )
 
     def _show_welcome_if_needed(self):
         """Show welcome dialog on first run"""
-        settings = QSettings('PCSX2-Manager', 'PatchTextureManager')
-        if not settings.value('welcome_shown', False):
+        settings = app_settings()
+        if not settings.value('welcome_shown', False, bool):
             msg = QMessageBox(self)
-            msg.setWindowTitle("Welcome to PCSX2 Manager!")
+            msg.setWindowTitle(f"Welcome to {APP_NAME}")
             msg.setTextFormat(Qt.RichText)
             msg.setText(
-                "<h2>Welcome!</h2>"
-                "<p>This tool helps you easily add cheats and texture packs to PCSX2.</p>"
-                "<br>"
-                "<p><b>Quick Start:</b></p>"
+                f"<h3>Welcome to {APP_NAME}</h3>"
                 "<ol>"
-                "<li>Click the gear icon and verify your PCSX2 folder</li>"
-                "<li>Use <b>Scan Folder</b> to add the games you own to your library</li>"
-                "<li>Select a game and click <b>Install</b> to install its cheats and textures</li>"
+                "<li>Open <b>File \u25b8 Settings</b> and check your PCSX2 folder.</li>"
+                "<li>Use <b>File \u25b8 Scan Folder</b> to add the games you own.</li>"
+                "<li>Select a game and press <b>Enter</b> to install its cheats and textures.</li>"
                 "</ol>"
-                "<br>"
-                "<p><i>Tip: You can drag & drop .pnach files and texture packs!</i></p>"
+                "<p>Press <b>F11</b> any time for Big Picture mode.</p>"
             )
             msg.setStandardButtons(QMessageBox.Ok)
             msg.exec()
@@ -7389,17 +8814,22 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean up all running threads before closing."""
         logger.info("Application closing - cleaning up workers...")
+        try:
+            self.library_view.save_view_prefs()
+        except Exception:
+            pass
+        self.library_view.bp.shutdown()
 
         # Set shutdown flags to prevent new workers
-        for tab_name in ['cheats_tab', 'textures_tab', 'library_view']:
-            if hasattr(self, tab_name):
-                tab = getattr(self, tab_name)
-                tab._shutting_down = True
+        # (the private attributes: the lazy properties would build the
+        # editors just to shut them down)
+        built = [t for t in (self._cheats_tab, self._textures_tab, getattr(self, 'library_view', None)) if t is not None]
+        for tab in built:
+            tab._shutting_down = True
 
         # Clean up workers in each widget
-        for tab_name in ['cheats_tab', 'textures_tab', 'library_view']:
-            if hasattr(self, tab_name):
-                self._cleanup_workers(getattr(self, tab_name))
+        for tab in built:
+            self._cleanup_workers(tab)
 
         logger.info("Worker cleanup complete")
         event.accept()
@@ -7408,13 +8838,14 @@ class MainWindow(QMainWindow):
 
 def main():
     set_windows_app_user_model_id()
-    QCoreApplication.setOrganizationName("PCSX2-Manager")
-    QCoreApplication.setApplicationName("PatchTextureManager")
+    QCoreApplication.setOrganizationName(APP_NAME)
+    QCoreApplication.setApplicationName(APP_NAME)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(APP_ICON_ICO_PATH))
+    migrate_legacy_settings(QSettings(*_LEGACY_SETTINGS), app_settings())
+    theme.apply_theme(app, app_settings().value('ui/mode', theme.MODE_CLASSIC, str))
     w = MainWindow()
-    effects.fade_in(w, duration=320)
-    w.show()
+    w.show_initial()
     sys.exit(app.exec())
 
 

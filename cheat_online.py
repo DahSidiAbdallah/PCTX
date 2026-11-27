@@ -1,4 +1,4 @@
-"""Online cheat database integration for PCSX2 Patch & Texture Manager.
+"""Online cheat database integration for PCTX.
 This module provides small, respectful scrapers/parsers and returns a
 list of structured entries. Each entry is a dict with keys:
  - source: short source name
@@ -227,7 +227,7 @@ def resolve_serial_online(serial_variants, urls=None, timeout=8):
     """
     if not requests:
         return None, None, None
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; PCSX2-Manager/1.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PCTX/2.0)"}
     found_title = found_crc = found_html = None
     for url in (urls or PSXDATACENTER_URLS):
         resp = _safe_get(url, timeout=timeout, headers=headers)
@@ -271,7 +271,7 @@ def fetch_psxdatacenter_cheats(serial_or_crc):
     if not requests or not BeautifulSoup:
         return []
     out = []
-    headers = {"User-Agent": "PCSX2-Manager/1.0 (+https://example)"}
+    headers = {"User-Agent": "PCTX/2.0"}
     serial_variants = [serial_or_crc, serial_or_crc.upper().replace('-', '').replace('_', '')]
     for url in PSXDATACENTER_URLS:
         resp = _safe_get(url, headers=headers)
@@ -337,7 +337,7 @@ def fetch_gamehacking_org_cheats(serial_or_crc):
     if not requests:
         return []
     out = []
-    headers = {"User-Agent": "PCSX2-Manager/1.0 (+https://example)"}
+    headers = {"User-Agent": "PCTX/2.0"}
     api_url = f'https://gamehacking.org/api/search?game={serial_or_crc}'
     resp = _safe_get(api_url, headers=headers)
     if resp and resp.status_code == 200:
@@ -459,7 +459,7 @@ def _normalize_code_lines(lines):
     return out
 
 
-def fetch_and_cache_cheats(serial_or_crc, cache_dir="cheat_cache"):
+def fetch_and_cache_cheats(serial_or_crc, cache_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cheat_cache")):
     """Fetch cheats and cache them.
 
     Parameters:

@@ -3,3 +3,4 @@ beautifulsoup4
 requests
 qtawesome
 py7zr
+pyyaml

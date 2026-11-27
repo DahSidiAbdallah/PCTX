@@ -4,15 +4,27 @@ import pytest
 
 # Provide light-weight PySide6 stubs so tests can import main.py without GUI deps
 if 'PySide6' not in sys.modules:
-    fake = types.SimpleNamespace()
-    # minimal nested modules used by main.py
-    # Create simple modules with the required names so 'from PySide6.QtWidgets import QApplication, ...' succeeds
-    qw = types.SimpleNamespace()
-    # Define dummy classes/objects referenced in main.py (they won't be instantiated in tests)
-    for name in ['QApplication','QMainWindow','QWidget','QFileDialog','QTabWidget','QVBoxLayout','QHBoxLayout','QFormLayout','QLineEdit','QTextEdit','QPushButton','QLabel','QHeaderView','QMessageBox','QListWidget','QProgressBar','QGroupBox','QComboBox','QCheckBox','QDialog','QListWidgetItem','QAbstractItemView','QRadioButton','QTreeWidget','QTreeWidgetItem','QMenu','QInputDialog']:
-        setattr(qw, name, type(name, (), {}))
-    qc = types.SimpleNamespace()
-    # Provide a Signal callable that accepts args and returns a dummy object
+    class _DynamicModule(types.ModuleType):
+        def __init__(self, name):
+            super().__init__(name)
+            self.__path__ = []
+
+        def __getattr__(self, name):
+            if name == '__all__':
+                return []
+            if name == '__path__':
+                return []
+            dummy = type(name, (), {})
+            setattr(self, name, dummy)
+            return dummy
+
+    fake = _DynamicModule('PySide6')
+    qw = _DynamicModule('PySide6.QtWidgets')
+    qc = _DynamicModule('PySide6.QtCore')
+    qg = _DynamicModule('PySide6.QtGui')
+    qwc = _DynamicModule('PySide6.QtWebChannel')
+    qwe = _DynamicModule('PySide6.QtWebEngineWidgets')
+
     class _Signal:
         def __init__(self, *args, **kwargs):
             pass
@@ -20,19 +32,33 @@ if 'PySide6' not in sys.modules:
             pass
         def emit(self, *a, **k):
             pass
-    for name in ['Qt','QThread','QSize','QSettings','QTimer']:
-        setattr(qc, name, type(name, (), {}))
-    setattr(qc, 'Signal', _Signal)
-    qg = types.SimpleNamespace()
-    for name in ['QIcon','QPixmap','QDragEnterEvent','QDropEvent','QAction']:
-        setattr(qg, name, type(name, (), {}))
+
+    def _slot(*args, **kwargs):
+        def dec(fn):
+            return fn
+        return dec
+
+    class _DynamicMeta(type):
+        def __getattr__(cls, name):
+            return 0
+
+    class _Qt(metaclass=_DynamicMeta):
+        pass
+
+    qc.Qt = _Qt
+    qc.Signal = _Signal
+    qc.Slot = _slot
     fake.QtWidgets = qw
     fake.QtCore = qc
     fake.QtGui = qg
+    fake.QtWebChannel = qwc
+    fake.QtWebEngineWidgets = qwe
     sys.modules['PySide6'] = fake
     sys.modules['PySide6.QtWidgets'] = qw
     sys.modules['PySide6.QtCore'] = qc
     sys.modules['PySide6.QtGui'] = qg
+    sys.modules['PySide6.QtWebChannel'] = qwc
+    sys.modules['PySide6.QtWebEngineWidgets'] = qwe
 
 from main import parse_pnach_text, build_pnach
 
