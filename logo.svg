@@ -1,29 +1,23 @@
-<svg width="1200" height="360" viewBox="0 0 1200 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="790" height="280" viewBox="0 0 790 280" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="logoBgGrad" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#080F1A"/>
+    <linearGradient id="logoBgGrad" x1="0" y1="0" x2="790" y2="280" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0A1220"/>
       <stop offset="100%" stop-color="#04080F"/>
     </linearGradient>
-    <linearGradient id="badgeBg" x1="60" y1="50" x2="280" y2="290" gradientUnits="userSpaceOnUse">
+    <linearGradient id="badgeBg" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#121F33"/>
       <stop offset="50%" stop-color="#0B1422"/>
       <stop offset="100%" stop-color="#060A11"/>
     </linearGradient>
-    <linearGradient id="badgeBorder" x1="60" y1="50" x2="280" y2="290" gradientUnits="userSpaceOnUse">
+    <linearGradient id="badgeBorder" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#67D5FF"/>
       <stop offset="50%" stop-color="#3B82F6"/>
       <stop offset="100%" stop-color="#1D4ED8"/>
     </linearGradient>
-    <linearGradient id="titleGrad" x1="330" y1="90" x2="680" y2="200" gradientUnits="userSpaceOnUse">
+    <linearGradient id="titleGrad" x1="300" y1="80" x2="800" y2="200" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FFFFFF"/>
-      <stop offset="60%" stop-color="#E1F4FF"/>
+      <stop offset="65%" stop-color="#E1F4FF"/>
       <stop offset="100%" stop-color="#A5DEFF"/>
-    </linearGradient>
-    <linearGradient id="lineGrad" x1="330" y1="215" x2="1120" y2="215" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#67D5FF"/>
-      <stop offset="35%" stop-color="#2563EB"/>
-      <stop offset="80%" stop-color="#1E293B"/>
-      <stop offset="100%" stop-color="#0B1422" stop-opacity="0"/>
     </linearGradient>
     <linearGradient id="pGradLogo" x1="100" y1="90" x2="220" y2="230" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FFFFFF"/>
@@ -39,38 +33,24 @@
     </linearGradient>
   </defs>
 
-  <!-- Background Card -->
-  <rect width="1200" height="360" rx="24" fill="url(#logoBgGrad)"/>
-  <rect x="1" y="1" width="1198" height="358" rx="23" stroke="#1E293B" stroke-width="2"/>
+  <!-- Card -->
+  <rect width="790" height="280" rx="28" fill="url(#logoBgGrad)"/>
+  <rect x="1" y="1" width="788" height="278" rx="27" stroke="#1E293B" stroke-width="2"/>
 
-  <!-- Left Emblem (240x240 centered vertically) -->
-  <g id="badgeGroup" transform="translate(60, 60)">
-    <rect x="0" y="0" width="240" height="240" rx="54" fill="url(#badgeBg)" stroke="url(#badgeBorder)" stroke-width="7"/>
-    <rect x="4" y="4" width="232" height="232" rx="50" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="1.5"/>
-
-    <!-- Scaled Monogram -->
-    <g transform="translate(6, -2) scale(0.52)">
-      <!-- Outer P Spine & Loop -->
+  <!-- Emblem (same mark as the app icon) -->
+  <g transform="translate(70, 40)">
+    <rect x="0" y="0" width="200" height="200" rx="46" fill="url(#badgeBg)" stroke="url(#badgeBorder)" stroke-width="6"/>
+    <rect x="4" y="4" width="192" height="192" rx="42" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="1.5"/>
+    <g transform="translate(2, -4) scale(0.44)">
       <path d="M152 130V382H216V298H244C298 298 334 266 334 214C334 162 298 130 244 130H152Z" fill="url(#pGradLogo)"/>
-      <!-- Inner P Cutout -->
       <path d="M216 182H240C268 182 284 195 284 214C284 233 268 246 240 246H216V182Z" fill="#0B1422"/>
-      <!-- Dynamic 'X' Crossing Beams -->
       <path d="M242 152L346 256" stroke="url(#cyanBeamLogo)" stroke-width="24" stroke-linecap="round"/>
       <path d="M346 152L242 256" stroke="url(#cyanBeamLogo)" stroke-width="24" stroke-linecap="round"/>
-      <!-- Lower PS2 Accent Wing -->
       <path d="M256 276L346 366" stroke="url(#blueBeamLogo)" stroke-width="20" stroke-linecap="round"/>
       <path d="M346 276L256 366" stroke="url(#blueBeamLogo)" stroke-width="20" stroke-linecap="round"/>
     </g>
   </g>
 
-  <!-- Typography Right Column -->
-  <text x="340" y="180" fill="url(#titleGrad)" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="124" font-weight="900" letter-spacing="-3">PCTX</text>
-  <text x="670" y="152" fill="#38BDF8" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="28" font-weight="700" letter-spacing="4">v2.0</text>
-
-  <!-- Sleek Accent Line -->
-  <line x1="340" y1="210" x2="1100" y2="210" stroke="url(#lineGrad)" stroke-width="3"/>
-
-  <!-- Subtitle & Capabilities -->
-  <text x="342" y="254" fill="#60A5FA" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="24" font-weight="700" letter-spacing="6">PCSX2 PATCH &amp; TEXTURE MANAGER</text>
-  <text x="342" y="292" fill="#7E9BB8" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" letter-spacing="3">LIBRARY SYNC  •  PNACH EDITOR  •  TEXTURE INJECTOR  •  OFFLINE READY</text>
+  <!-- Name -->
+  <text x="318" y="183" fill="url(#titleGrad)" font-family="'Segoe UI', system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif" font-size="150" font-weight="900" letter-spacing="-2">PCTX</text>
 </svg>

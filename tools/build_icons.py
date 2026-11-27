@@ -8,6 +8,7 @@ Needs PySide6 (already a dependency) and Pillow (build-time only:
 Outputs (repo root):
     app_icon.ico   multi-resolution Windows icon, used for the window/taskbar
     app_icon.png   512 px render of app_icon.svg (docs, non-Windows)
+    logo.png       2x render of logo.svg (the README header)
 
 Why the small sizes are drawn separately: the full mark (a thin glowing X
 crossing the P's bowl, plus a second thin X below) is fine at 64 px and up but
@@ -80,7 +81,17 @@ def main() -> int:
         sizes=[(s, s) for s in sorted(frames)],
         append_images=[frames[s] for s in sorted(frames) if s != 256],
     )
-    print("wrote app_icon.png and app_icon.ico with sizes", sorted(frames))
+    renderer = QSvgRenderer(QByteArray(open(os.path.join(ROOT, "logo.svg"), "rb").read()))
+    size = renderer.defaultSize() * 2
+    logo = QImage(size, QImage.Format_ARGB32)
+    logo.fill(Qt.transparent)
+    p = QPainter(logo)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.TextAntialiasing)
+    renderer.render(p)
+    p.end()
+    logo.save(os.path.join(ROOT, "logo.png"))
+    print("wrote app_icon.png, logo.png and app_icon.ico with sizes", sorted(frames))
     return 0
 
 
