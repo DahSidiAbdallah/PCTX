@@ -11,3 +11,6 @@ dist/
 # Runtime caches / generated at runtime
 cheat_cache/*.json
 !cheat_cache/.gitkeep
+
+# Release build output
+packaging/build/

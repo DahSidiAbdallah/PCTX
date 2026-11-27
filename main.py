@@ -186,7 +186,20 @@ def app_settings() -> QSettings:
     override = os.environ.get("PCTX_SETTINGS_FILE")
     if override:
         return QSettings(override, QSettings.IniFormat)
+    if PORTABLE_DIR:
+        return QSettings(os.path.join(PORTABLE_DIR, "PCTX.ini"), QSettings.IniFormat)
     return QSettings(APP_NAME, APP_NAME)
+
+
+def _portable_dir() -> Optional[str]:
+    """Portable mode, like PCSX2's: a `portable.txt` next to PCTX.exe (or next
+    to main.py when running from source) keeps settings in that folder instead
+    of the Windows registry, so the whole folder can live on a USB stick."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else _ASSETS_DIR
+    return base if os.path.isfile(os.path.join(base, "portable.txt")) else None
+
+
+PORTABLE_DIR = _portable_dir()
 
 
 def migrate_legacy_settings(old: QSettings, new: QSettings) -> int:

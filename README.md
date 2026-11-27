@@ -53,7 +53,16 @@ Switch any time with **F11** (or View > Big Picture). PCTX remembers which one y
 
 With a mouse: click to select, scroll to browse, right-click to go back, double-click a game to play it.
 
-## Getting started
+## Download
+
+Get the latest version from the [Releases](https://github.com/DahSidiAbdallah/PCSX2-Patch_Texture-Manager/releases) page. You need Windows 10 or 11 (64-bit) and an existing PCSX2 install; nothing else.
+
+- **Installer** (`PCTX-<version>-Setup.exe`): installs PCTX for your Windows user (no administrator prompt) with Start-menu and desktop shortcuts and an uninstaller.
+- **Portable** (`PCTX-<version>-Windows-Portable.zip`): unzip anywhere, for example next to a portable PCSX2, and run `PCTX.exe`. Like PCSX2's portable build, it keeps its settings in that folder (`PCTX.ini`) because of the `portable.txt` file next to it; delete `portable.txt` to use normal per-user settings instead.
+
+Windows SmartScreen may warn about a new, unsigned app the first time you run it; choose **More info > Run anyway**.
+
+## Running from source
 
 You need Windows, Python 3.10 or newer, and an existing PCSX2 install.
 
@@ -109,6 +118,7 @@ Search results that are not in the hand-checked list are labelled by how well th
 | `cheat_online.py`, `textures_install.py`, `texture_upscale.py` | Cheat lookup, texture pack installation, AI upscaling |
 | `texture_sources.json` | Curated texture pack list |
 | `tools/build_icons.py` | Regenerates the app icon from its SVG sources |
+| `packaging/` | Release builds: `python packaging/build_release.py` makes the portable zip and the installer (PyInstaller, Inno Setup 6) |
 | `tests/` | Test suite |
 
 ## Troubleshooting
